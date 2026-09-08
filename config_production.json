@@ -1,0 +1,63 @@
+{
+  "system_metadata": {
+    "system_name": "Ema_testnet_Production_V1",
+    "version": "1.0.0",
+    "strategy_mode": "Unleveraged_Volatility_Budgeted",
+    "signal_definition": "9_15_EMA_Crossover_15m_Close",
+    "timestamp_utc": "2026-09-08T15:35:00Z"
+  },
+  "capital_and_slots": {
+    "total_account_capital": 10000.0,
+    "total_slots": 5,
+    "max_cash_per_slot": 2000.0,
+    "base_risk_budget_usd": 50.0,
+    "max_concurrent_trades": 5,
+    "enforce_unleveraged_1x": true,
+    "fixed_leverage": 1.0
+  },
+  "leverage_policy": {
+    "mode": "UNIFORM_FIXED",
+    "uniform_leverage": 1.0,
+    "danger_loss_budget_k": 3.0,
+    "max_leverage_cap": 5.0,
+    "min_leverage_floor": 1.0
+  },
+  "trailing_stop_policy": {
+    "enabled": false,
+    "breakeven_trigger_pct_of_tp": 0.40,
+    "breakeven_lock_pct": 0.20,
+    "profit_trail_trigger_pct_of_tp": 0.75,
+    "profit_trail_capture_ratio": 0.65
+  },
+  "risk_and_hurdle_policy": {
+    "min_rr_hurdle": 2.00,
+    "dynamic_tp_multiplier": 1.00,
+    "dynamic_sl_multiplier": 1.00,
+    "danger_cls_threshold": 0.50,
+    "profit_cls_threshold": 0.50,
+    "category_multipliers": {
+      "LOW_RISK__HIGH_PROFIT": 1.5,
+      "LOW_RISK__LOW_PROFIT": 1.0,
+      "HIGH_RISK__HIGH_PROFIT": 0.5,
+      "HIGH_RISK__LOW_PROFIT": 0.0
+    }
+  },
+  "exchange_execution": {
+    "target_exchange": "binanceusdm",
+    "use_testnet_sandbox": true,
+    "margin_mode": "ISOLATED",
+    "entry_order_type": "LIMIT",
+    "reversal_exit_order_type": "MARKET",
+    "time_in_force": "GTC",
+    "limit_order_timeout_minutes": 15,
+    "taker_fee_rate": 0.0004,
+    "slippage_rate": 0.0005,
+    "active_symbols": [
+      "BTCUSDT",
+      "DOGEUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "XRPUSDT"
+    ]
+  }
+}

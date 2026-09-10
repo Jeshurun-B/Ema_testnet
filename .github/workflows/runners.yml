@@ -1,41 +1,94 @@
+# ====================================================================================================
+# ALGORITHM: .github/workflows/runner.yml — 5.5-Hour Self-Chaining Daemon Workflow
+# ====================================================================================================
+# Purpose:
+#   Define the continuous CI/CD execution harness for the `ema_testnet` production trading engine.
+#   Implements a long-running, self-triggering Linux daemon (running for 5 hours and 20 minutes)
+#   with concurrency locking, secret injection, dependency management, and real-time unbuffered
+#   stdout log streaming.
+#
+# Key Architectural Features:
+#   1. Zero Cron Jitter (Self-Chaining Worker Pattern):
+#      - Eliminates reliance on GitHub's delayed 5-minute cron queue.
+#      - Wakes up via `workflow_dispatch` (triggered either manually or autonomously by `main.py`).
+#      - A fallback schedule (`cron: '0 */6 * * *'`) guarantees auto-recovery if a job ever drops.
+#   2. Concurrency Shield:
+#      - Locks the workflow group `binance-testnet-worker` with `cancel-in-progress: false`.
+#      - Guarantees that only ONE trading daemon container runs at any given time, preventing
+#        duplicate order placement or race conditions on Binance Testnet.
+#   3. Instantaneous Real-Time Streaming:
+#      - Injects `PYTHONUNBUFFERED: "1"` and invokes `python -u main.py`.
+#      - Disables Linux 4KB block-buffering in non-TTY runners so all console logs flush to the
+#        GitHub Actions web UI immediately on every newline.
+#   4. Permission Configuration:
+#      - Configures `actions: write` and `contents: write` so `main.py` can call GitHub's REST API
+#        to trigger its successor job before reaching the 6-hour execution ceiling.
+#
+# Workflow Steps:
+#   Step 1: Declare Workflow Metadata, Triggers & Concurrency Controls
+#     - Enable workflow_dispatch for on-demand start and self-chaining.
+#     - Enable backup schedule cron every 6 hours.
+#     - Lock concurrency group to prevent overlapping containers.
+#   Step 2: Define Job Environment & Elevated Permissions
+#     - Set runner image to ubuntu-latest.
+#     - Assign write permissions for `actions` and `contents`.
+#   Step 3: Checkout Source Repository
+#     - Use actions/checkout@v4 to clone `ema_testnet` codebase into the workspace.
+#   Step 4: Provision Python Runtime Environment
+#     - Use actions/setup-python@v5 with Python 3.12.
+#   Step 5: Install Python Dependencies
+#     - Upgrade pip and install pinned libraries (ccxt, pandas, numpy, torch, catboost, ta, supabase, requests).
+#   Step 6: Execute 5.5-Hour Daemon with Real-Time Unbuffered Streaming
+#     - Inject secrets: BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET, SUPABASE_URL, SUPABASE_KEY.
+#     - Set PYTHONUNBUFFERED: "1".
+#     - Run `python -u main.py` in unbuffered mode.
+# ====================================================================================================
+
+# ── STEP 1: Triggers & Concurrency Controls ──────────────────────────────────────────────────────────
 name: EMA Testnet Production Daemon
 
 on:
-  # 1. Primary Trigger: Self-chaining dispatch via GitHub REST API
+  # Primary Trigger: Self-chaining dispatch via GitHub REST API (called by main.py at 5h 20m)
   workflow_dispatch:
   
-  # 2. Safety Net: Backup cron every 6 hours
+  # Safety Net: Fallback cron every 6 hours in case of unexpected network drops
   schedule:
     - cron: '0 */6 * * *'
 
-# Concurrency Guard: Guarantees ONLY ONE worker runs at any time
+# Concurrency Guard: Prevents two runners from executing simultaneously
 concurrency:
   group: binance-testnet-worker
   cancel-in-progress: false
 
+# ── STEP 2: Job Environment & Permissions ─────────────────────────────────────────────────────────────
 jobs:
   run-trader:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write
+      actions: write  # Required for main.py to call GitHub REST API to trigger next runner
 
     steps:
+      # ── STEP 3: Checkout Repository ──
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # ── STEP 4: Set up Python 3.12 ──
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      # ── STEP 5: Install Dependencies ──
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install ccxt pandas numpy torch catboost ta supabase requests
 
+      # ── STEP 6: Execute 5.5-Hour Daemon (Unbuffered Real-Time Streaming) ──
       - name: Run 5.5-Hour Self-Chaining Trading Engine
         env:
+          PYTHONUNBUFFERED: "1"  # Disables 4KB stdout block-buffering; streams logs instantly
           BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
           BINANCE_TESTNET_API_SECRET: ${{ secrets.BINANCE_TESTNET_API_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -43,4 +96,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python main.py
+          python -u main.py  # '-u' flag forces binary unbuffered stdout and stderr

@@ -72,6 +72,11 @@ from datetime import datetime, timezone
 import pandas as pd
 import torch
 
+import sys
+# Force immediate real-time line buffering on all print statements:
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+  
 # Ingest Production Submodules
 try:
     from src.telemetry import TelemetryEngine

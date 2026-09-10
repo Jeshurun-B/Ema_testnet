@@ -4,11 +4,11 @@ on:
   # 1. Primary Trigger: Self-chaining dispatch via GitHub REST API
   workflow_dispatch:
   
-  # 2. Safety Net: Backup cron every 6 hours in case GitHub network terminates a job
+  # 2. Safety Net: Backup cron every 6 hours
   schedule:
     - cron: '0 */6 * * *'
 
-# Concurrency Guard: Guarantees ONLY ONE worker runs at any time (prevents duplicate orders)
+# Concurrency Guard: Guarantees ONLY ONE worker runs at any time
 concurrency:
   group: binance-testnet-worker
   cancel-in-progress: false
@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write  # Mandatory for self-triggering the next worker job via API
+      actions: write
 
     steps:
       - name: Checkout Repository
@@ -28,12 +28,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt pandas numpy torch catboost ta supabase requests
+          pip install -r requirements.txt
 
       - name: Run 5.5-Hour Self-Chaining Trading Engine
         env:

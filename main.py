@@ -1,23 +1,50 @@
 """
 ====================================================================================================
-ALGORITHM: main.py — Autonomous Production Daemon with Rejection Telemetry
+ALGORITHM: main.py — Autonomous Production Daemon with Idempotent Deduplication
 ====================================================================================================
 Purpose:
-  Operates as an autonomous 5.5-hour trading daemon inside GitHub Actions. Wakes up on closed
+  Operate as an autonomous 5.5-hour trading daemon inside GitHub Actions. Wakes up on closed
   15-minute candles, runs in-flight order maintenance every 30s, evaluates crossovers, logs approved
-  orders to Table 1, logs REJECTED signals to Table 2, and self-chains at 5 hours 20 minutes.
+  orders to Table 1, logs rejected signals to Table 2, and self-chains at 5 hours 20 minutes.
 
-Key Updates:
-  - When manifest["approved"] is False, calls `telemetry.record_rejected_signal(...)`, logging
-    the rejection reason, predicted MFE/MAE, and R:R directly into Supabase Table 2!
+Key Microstructure & Ingestion Enhancements:
+  1. Idempotent Bar Timestamp Guard (`last_evaluated_candles`):
+     - Tracks the ISO timestamp of the last processed closed candle for each asset in RAM.
+     - If Binance Testnet's REST API experiences candle aggregation lag and returns a stale bar,
+       the engine detects that `candle_close_utc == last_evaluated_candles[symbol]` and rejects the
+       duplicate evaluation immediately.
+  2. 5.0-Second Exchange Settlement Buffer:
+     - Increases post-close sleep from 1.5s to 5.0s (`seconds_until_close + 5.0`).
+     - Grants the Binance Testnet database matching engine adequate time to finalize and publish
+       the newly closed 15m OHLCV bar before CCXT queries `fetch_ohlcv()`.
+  3. Rejection Telemetry to Supabase Table 2:
+     - When `manifest["approved"]` is False, logs the rejection reason, predicted MFE/MAE,
+       and R:R directly into Supabase Table 2 under `close_reason = 'GATE_REJECTED'`.
 
 Algorithm Steps:
-  1. Module Setup & Secrets Ingestion.
-  2. RAM Model Loading (CatBoost + Funnel GRU).
-  3. Self-Chaining Handover Trigger via GitHub API.
-  4. In-Flight Position Maintenance (Every 30s).
-  5. 15-Minute Pipeline (Signal Detection, Reversal Market Exit, Sizing, and Order/Rejection Logging).
-  6. Autonomous 5.5-Hour Execution Loop.
+  Step 1: Module Setup, Force Unbuffered Line Output & Dependency Ingestion:
+          - Import standard libraries, requests, pandas, torch.
+          - Reconfigure stdout for real-time line buffering.
+  Step 2: In-Memory Engine Initialization:
+          - Instantiate TelemetryEngine, ProductionModelRegistry, ProductionGatesEngine, and ExecutionEngine.
+          - Initialize `last_evaluated_candles` dictionary to track bar idempotency.
+  Step 3: Self-Chaining Handover Trigger via GitHub Actions REST API:
+          - At 320 minutes (~5.33 hours), dispatch successor workflow to ensure zero-downtime 24/7 operation.
+  Step 4: Position Maintenance Routine (Every 30 Seconds):
+          - Inspect PENDING_LIMIT fills and deploy 2-stage native reduce-only TP/SL brackets.
+          - Cancel expired limit orders exceeding 15m timeout (logged as MISSED_TRADE).
+          - Reconcile closed positions with Binance trade fills and archive to Table 2.
+  Step 5: 15-Minute Pipeline with Idempotent Deduplication:
+          - Query closed multi-timeframe candles (15m, 4h, 1d) via the proxy tunnel.
+          - Detect 9/15 EMA crossover on completed candle [-1] vs [-2].
+          - Check Idempotency Guard: skip if this exact candle timestamp was already evaluated.
+          - On signal flip, liquidate existing opposing position immediately.
+          - Extract 25 master indicators and run sub-10ms dual-engine model inference.
+          - Evaluate risk gates ($R:R \ge 2.0$ hurdle, 4-state matrix, danger sizing).
+          - Route limit entry order on approval or log rejection telemetry to Table 2.
+  Step 6: Autonomous 5.5-Hour Execution Loop with 5.0s Settlement Alignment:
+          - Execute 30-second maintenance cycles between candles.
+          - Sleep until `seconds_until_close + 5.0` to guarantee fresh OHLCV candle ingestion.
 ====================================================================================================
 """
 
@@ -55,11 +82,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 MAX_RUN_DURATION_MINUTES = 320
 MAINTENANCE_INTERVAL_SEC = 30
+EXCHANGE_SETTLEMENT_BUFFER_SEC = 5.0  # Gives Binance 5.0s to seal and publish the 15m candle
 
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
 BINANCE_KEY       = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
 BINANCE_SECRET    = os.environ.get("BINANCE_TESTNET_API_SECRET", "").strip()
+BINANCE_PROXY     = os.environ.get("BINANCE_PROXY_URL", "").strip()
 
 
 # =============================================================================
@@ -69,6 +98,7 @@ print("=========================================================================
 print("  EMA_TESTNET PRODUCTION DAEMON (AUTONOMOUS 5.5-HOUR WORKER)                   ")
 print(f"  Max Lifespan     : {MAX_RUN_DURATION_MINUTES} Minutes ({MAX_RUN_DURATION_MINUTES/60:.2f} Hours)")
 print(f"  Target Repository: {GITHUB_REPOSITORY}                                       ")
+print(f"  Settlement Buffer: +{EXCHANGE_SETTLEMENT_BUFFER_SEC}s post candle close     ")
 print("===============================================================================\n")
 
 print("1. Initializing Telemetry and Database Connections...")
@@ -79,9 +109,18 @@ model_registry = ProductionModelRegistry()
 gates_engine   = ProductionGatesEngine()
 
 print("3. Connecting Execution Engine to Binance Futures Testnet...")
-execution = ExecutionEngine(api_key=BINANCE_KEY, api_secret=BINANCE_SECRET, telemetry=telemetry)
+execution = ExecutionEngine(
+    api_key=BINANCE_KEY,
+    api_secret=BINANCE_SECRET,
+    proxy_url=BINANCE_PROXY,
+    telemetry=telemetry
+)
 
 ACTIVE_SYMBOLS = ["BTCUSDT", "DOGEUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+# Idempotent State Tracker: Guards against duplicate evaluations caused by REST lag
+last_evaluated_candles = {sym: None for sym in ACTIVE_SYMBOLS}
+
 print("All engines initialized. Starting autonomous execution loop.\n")
 
 
@@ -89,6 +128,7 @@ print("All engines initialized. Starting autonomous execution loop.\n")
 # STEP 3: Self-Chaining Dispatcher (GitHub Actions REST API)
 # =============================================================================
 def dispatch_successor_workflow():
+    """Dispatches the next 5.5-hour workflow runner via GitHub REST API."""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         print("[Warning] GITHUB_TOKEN or GITHUB_REPOSITORY missing. Cannot self-chain.")
         return False
@@ -118,16 +158,20 @@ def dispatch_successor_workflow():
 # STEP 4: Position Maintenance Routine (Every 30 Seconds)
 # =============================================================================
 def run_position_maintenance():
+    """Polls in-flight orders, deploys brackets upon fill, and manages timeouts."""
     active_orders = telemetry.get_active_trades()
     if not active_orders:
         return
 
+    # Check for Limit Entry Fills & Deploy Native Brackets
     for trade in active_orders:
         if trade.get("order_status") == "PENDING_LIMIT":
             execution.check_and_deploy_brackets(trade)
 
+    # Cancel expired 15-minute limit entry orders
     execution.handle_expired_limit_orders(max_timeout_minutes=15)
 
+    # Inspect FILLED orders against active Binance positions
     live_positions = execution.get_active_positions()
     now_utc = datetime.now(timezone.utc)
 
@@ -173,12 +217,16 @@ def run_position_maintenance():
 
 
 # =============================================================================
-# STEP 5: 15-Minute Pipeline (With Rejection Telemetry to Supabase)
+# STEP 5: 15-Minute Pipeline (With Idempotent Deduplication Guard)
 # =============================================================================
 def run_candle_close_pipeline():
+    """Evaluates 9/15 crossovers, runs dual models, and routes orders or rejection logs."""
+    global last_evaluated_candles
     t_start = time.perf_counter()
+    eval_time_str = datetime.now(timezone.utc).strftime('%H:%M:%S')
+
     print(f"\n───────────────────────────────────────────────────────────────────────────────")
-    print(f"  EVALUATING 15-MINUTE CANDLE CLOSE AT {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
+    print(f"  EVALUATING 15-MINUTE CANDLE CLOSE AT {eval_time_str} UTC")
     print(f"───────────────────────────────────────────────────────────────────────────────")
 
     free_cash = execution.get_free_usdt_balance()
@@ -196,6 +244,15 @@ def run_candle_close_pipeline():
             signal, cross_price, candle_close_utc = detect_crossover(df_15m)
             if not signal:
                 continue
+
+            # ── THE IDEMPOTENT DEDUPLICATION GUARD ──
+            # If the exchange REST API lagged and returned the same completed candle timestamp, skip it!
+            if last_evaluated_candles.get(symbol) == candle_close_utc:
+                print(f"[Idempotency Notice] {symbol} candle {candle_close_utc} already evaluated. Skipping duplicate query.")
+                continue
+
+            # Mark this candle timestamp as processed
+            last_evaluated_candles[symbol] = candle_close_utc
 
             print(f"\n[Crossover Fired] {symbol} -> {signal} at ${cross_price:,.2f} (Candle Close: {candle_close_utc})")
 
@@ -243,8 +300,6 @@ def run_candle_close_pipeline():
                 free_cash = execution.get_free_usdt_balance()
             else:
                 print(f"   --> REJECTED: {manifest['rejection_reason']} (R:R = {manifest['rr_ratio']})")
-                
-                # ── LOG REJECTION TELEMETRY DIRECTLY TO SUPABASE TABLE 2 ──
                 telemetry.record_rejected_signal(symbol, signal, cross_price, manifest)
                 print(f"       Rejection telemetry logged to Supabase Table 2 (testnet_trade_log).")
 
@@ -256,9 +311,10 @@ def run_candle_close_pipeline():
 
 
 # =============================================================================
-# STEP 6: Autonomous 5.5-Hour Execution Loop
+# STEP 6: Autonomous 5.5-Hour Execution Loop with 5.0s Buffer
 # =============================================================================
 def main():
+    """Master daemon execution loop governing scheduling, maintenance, and self-chaining."""
     daemon_start_time = time.time()
     print(f"\n[Daemon Started] Autonomous 5.5-Hour loop active at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.")
     last_processed_15m_block = None
@@ -268,6 +324,7 @@ def main():
             now_dt = datetime.now(timezone.utc)
             elapsed_minutes = (time.time() - daemon_start_time) / 60.0
 
+            # Self-Chaining Lifespan Check
             if elapsed_minutes >= MAX_RUN_DURATION_MINUTES:
                 print(f"\n[Lifespan Reached] {elapsed_minutes:.1f} / {MAX_RUN_DURATION_MINUTES} Mins elapsed. Handover initiated.")
                 success = dispatch_successor_workflow()
@@ -275,8 +332,9 @@ def main():
                     time.sleep(15)
                     break
                 else:
-                    daemon_start_time += 900
+                    daemon_start_time += 900  # Extend 15m if dispatch fails
 
+            # Run 30-Second In-Flight Order Maintenance
             run_position_maintenance()
 
             current_minute = now_dt.minute
@@ -286,14 +344,16 @@ def main():
             seconds_into_15m = (current_minute % 15) * 60 + current_second
             seconds_until_close = 900 - seconds_into_15m
 
+            # Catch immediate edge cases right after candle close
             if seconds_into_15m <= 15 and last_processed_15m_block != current_15m_block:
-                time.sleep(1.5)
+                time.sleep(EXCHANGE_SETTLEMENT_BUFFER_SEC)
                 run_candle_close_pipeline()
                 last_processed_15m_block = current_15m_block
                 continue
 
+            # Sleep-to-close alignment with 5.0s settlement buffer
             if seconds_until_close <= 150:
-                sleep_target = seconds_until_close + 1.5
+                sleep_target = seconds_until_close + EXCHANGE_SETTLEMENT_BUFFER_SEC
                 print(f"[Timing Engine] Approaching 15m candle close. Sleeping {sleep_target:.1f}s to align with close...")
                 time.sleep(sleep_target)
                 run_candle_close_pipeline()

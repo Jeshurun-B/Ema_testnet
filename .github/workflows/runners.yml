@@ -1,23 +1,17 @@
 # ====================================================================================================
-# ALGORITHM: .github/workflows/runner.yml — 5.5-Hour Daemon with Cloudflare WARP Bypass
+# ALGORITHM: .github/workflows/runner.yml — Autonomous 5.5-Hour Self-Chaining Production Daemon
 # ====================================================================================================
 # Purpose:
-#   Run the autonomous 5.5-hour trading daemon on GitHub Actions while bypassing Binance's US
-#   geo-blocking (HTTP 451). Routes outbound API traffic through Cloudflare WARP so the runner
-#   can freely query `demo-fapi.binance.com` for market data and order execution.
+#   Run the autonomous trading daemon on GitHub Actions 24/7. Completely purges the broken Cloudflare
+#   WARP tunnel (which resolved to US IPs), exposes the non-US forward proxy secret (BINANCE_PROXY_URL),
+#   installs pinned dependencies (including pysocks), and executes main.py with unbuffered line output.
 #
-# Key Architectural Fix:
-#   - Step 3 (Setup Cloudflare WARP): Installs and establishes an Anycast WARP tunnel on the runner
-#     before Python starts. Bypasses Azure US data center IP blocks on Binance.
-#
-# Workflow Steps:
-#   Step 1: Declare workflow metadata, triggers (workflow_dispatch + backup cron), and concurrency lock.
-#   Step 2: Assign runner image (ubuntu-latest) and write permissions for self-chaining.
-#   Step 3: Checkout repository source code.
-#   Step 4: Establish Cloudflare WARP tunnel (fscarmen/warp-on-actions@v1.4) to bypass HTTP 451.
-#   Step 5: Set up Python 3.12 runtime environment.
-#   Step 6: Install dependencies from requirements.txt.
-#   Step 7: Launch unbuffered 5.5-hour autonomous daemon (python -u main.py).
+# Algorithm Steps:
+#   Step 1: Define Workflow Triggers (manual dispatch, 6-hour cron backup, and concurrency control).
+#   Step 2: Checkout Repository source code via actions/checkout@v4.
+#   Step 3: Setup Python 3.12 Runtime via actions/setup-python@v5.
+#   Step 4: Install Dependencies from requirements.txt (including pysocks for SOCKS5/HTTP proxy support).
+#   Step 5: Execute Autonomous Trading Daemon with full environment injection (BINANCE_PROXY_URL, API keys, Supabase).
 # ====================================================================================================
 
 name: EMA Testnet Production Daemon
@@ -39,26 +33,27 @@ jobs:
       actions: write
 
     steps:
+      # Step 2: Checkout Repository
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ── STEP 4: Establish Cloudflare WARP Tunnel (Bypasses Binance HTTP 451 Block) ──
-      - name: Set up Cloudflare WARP
-        uses: fscarmen/warp-on-actions@v1.4
-
+      # Step 3: Set up Python 3.12 Runtime
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      # Step 4: Install Production Dependencies (includes pysocks)
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Step 5: Run 5.5-Hour Self-Chaining Trading Engine with Proxy Tunnel
       - name: Run 5.5-Hour Self-Chaining Trading Engine
         env:
           PYTHONUNBUFFERED: "1"
+          BINANCE_PROXY_URL: ${{ secrets.BINANCE_PROXY_URL }}
           BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
           BINANCE_TESTNET_API_SECRET: ${{ secrets.BINANCE_TESTNET_API_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

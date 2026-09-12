@@ -6,3 +6,4 @@ catboost>=1.2.0
 ta>=0.11.0
 supabase>=2.0.0
 requests>=2.31.0
+pysocks>=1.7.1

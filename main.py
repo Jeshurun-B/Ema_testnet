@@ -1,50 +1,53 @@
 """
 ====================================================================================================
-ALGORITHM: main.py — Autonomous Production Daemon with Idempotent Deduplication
+ALGORITHM: main.py — Always-Awake Production Daemon with Silent Heartbeat & Pure Crossover Exits
 ====================================================================================================
 Purpose:
-  Operate as an autonomous 5.5-hour trading daemon inside GitHub Actions. Wakes up on closed
-  15-minute candles, runs in-flight order maintenance every 30s, evaluates crossovers, logs approved
-  orders to Table 1, logs rejected signals to Table 2, and self-chains at 5 hours 20 minutes.
+  Autonomous 5.5-hour continuous trading engine. Operates on a silent, non-blocking 10-second
+  heartbeat loop: monitors fills, brackets, and timeouts in the background without terminal clutter,
+  and evaluates completed 15-minute candles at T+5.0s past the close. Strictly enforces pure
+  crossover exits: active trades terminate early IF AND ONLY IF a formal, completed opposite
+  9/15 EMA crossover is registered.
 
-Key Microstructure & Ingestion Enhancements:
-  1. Idempotent Bar Timestamp Guard (`last_evaluated_candles`):
-     - Tracks the ISO timestamp of the last processed closed candle for each asset in RAM.
-     - If Binance Testnet's REST API experiences candle aggregation lag and returns a stale bar,
-       the engine detects that `candle_close_utc == last_evaluated_candles[symbol]` and rejects the
-       duplicate evaluation immediately.
-  2. 5.0-Second Exchange Settlement Buffer:
-     - Increases post-close sleep from 1.5s to 5.0s (`seconds_until_close + 5.0`).
-     - Grants the Binance Testnet database matching engine adequate time to finalize and publish
-       the newly closed 15m OHLCV bar before CCXT queries `fetch_ohlcv()`.
-  3. Rejection Telemetry to Supabase Table 2:
-     - When `manifest["approved"]` is False, logs the rejection reason, predicted MFE/MAE,
-       and R:R directly into Supabase Table 2 under `close_reason = 'GATE_REJECTED'`.
+Key Architectural Invariants:
+  1. Silent Vigilance Heartbeat (Every 10s):
+     - Background maintenance loop checks order fills, timeouts, and bracket executions every 10s.
+     - Emits zero terminal spam during normal idle checks. Outputs appear ONLY when an event occurs
+       (fill, bracket deployment, timeout cancellation, or trade exit).
+  2. Pure Event-Driven Crossover Exits (No Continuous Regime Invalidation):
+     - An active trade is protected by its native, exchange-side Dynamic TP and Dynamic SL brackets.
+     - It terminates early IF AND ONLY IF a completed 15-minute candle registers a formal opposite
+       9/15 EMA crossover (Index [-1] vs [-2]).
+     - On reversal: instantly purges resting brackets on Binance and issues a Market Close order.
+  3. Surgical Candle Alignment (+5.0s Settlement Window):
+     - Evaluates completed bars at minute % 15 == 0 and second >= 5.0s.
+     - Block tracking tuple guarantees each 15-minute bar is evaluated strictly once.
+  4. Autonomous Self-Chaining at 320 Minutes:
+     - Dispatches successor runner via GitHub Actions REST API at 5h 20m for continuous 24/7 uptime.
 
 Algorithm Steps:
-  Step 1: Module Setup, Force Unbuffered Line Output & Dependency Ingestion:
-          - Import standard libraries, requests, pandas, torch.
-          - Reconfigure stdout for real-time line buffering.
+  Step 1: Module Setup, Real-Time Line Buffering & Dependency Ingestion:
+          - Import standard, networking, pandas, and CCXT libraries.
+          - Reconfigure stdout for immediate unbuffered streaming.
   Step 2: In-Memory Engine Initialization:
-          - Instantiate TelemetryEngine, ProductionModelRegistry, ProductionGatesEngine, and ExecutionEngine.
-          - Initialize `last_evaluated_candles` dictionary to track bar idempotency.
-  Step 3: Self-Chaining Handover Trigger via GitHub Actions REST API:
-          - At 320 minutes (~5.33 hours), dispatch successor workflow to ensure zero-downtime 24/7 operation.
-  Step 4: Position Maintenance Routine (Every 30 Seconds):
-          - Inspect PENDING_LIMIT fills and deploy 2-stage native reduce-only TP/SL brackets.
-          - Cancel expired limit orders exceeding 15m timeout (logged as MISSED_TRADE).
-          - Reconcile closed positions with Binance trade fills and archive to Table 2.
-  Step 5: 15-Minute Pipeline with Idempotent Deduplication:
-          - Query closed multi-timeframe candles (15m, 4h, 1d) via the proxy tunnel.
-          - Detect 9/15 EMA crossover on completed candle [-1] vs [-2].
-          - Check Idempotency Guard: skip if this exact candle timestamp was already evaluated.
-          - On signal flip, liquidate existing opposing position immediately.
-          - Extract 25 master indicators and run sub-10ms dual-engine model inference.
-          - Evaluate risk gates ($R:R \ge 2.0$ hurdle, 4-state matrix, danger sizing).
-          - Route limit entry order on approval or log rejection telemetry to Table 2.
-  Step 6: Autonomous 5.5-Hour Execution Loop with 5.0s Settlement Alignment:
-          - Execute 30-second maintenance cycles between candles.
-          - Sleep until `seconds_until_close + 5.0` to guarantee fresh OHLCV candle ingestion.
+          - Initialize TelemetryEngine, ProductionModelRegistry, ProductionGatesEngine, and ExecutionEngine.
+          - Load all 48 models into RAM once (eliminating disk I/O).
+  Step 3: Self-Chaining Handover Dispatcher:
+          - Trigger successor workflow via GitHub REST API before GitHub Actions 6-hour hard timeout.
+  Step 4: Silent In-Flight Position Maintenance Routine:
+          - Checks limit fills -> deploys resting brackets.
+          - Checks timeouts (>15m) -> cancels unfilled orders.
+          - Checks bracket executions -> reconciles realized PnL and archives to Supabase Table 2.
+          - Produces terminal output ONLY when an action is executed.
+  Step 5: 15-Minute Pipeline with Pure Crossover Exits:
+          - Ingests completed candles (15m, 4h, 1d) via the proxy tunnel.
+          - Detects 9/15 EMA crossover on completed candle [-1] vs [-2].
+          - Reconciles live positions: if an opposite crossover is confirmed, liquidates immediately.
+          - If setup is valid: computes 25 features, runs RAM inference, evaluates $R:R \ge 2.0$ hurdle,
+            and either routes a quantized limit entry or logs rejection telemetry to Table 2.
+  Step 6: Master Continuous Heartbeat Loop:
+          - Loops silently every 10 seconds.
+          - Executes the 15-minute evaluation pipeline precisely at T+5.0s.
 ====================================================================================================
 """
 
@@ -81,10 +84,10 @@ except ImportError:
 warnings.filterwarnings("ignore", category=UserWarning)
 
 MAX_RUN_DURATION_MINUTES = 320
-MAINTENANCE_INTERVAL_SEC = 30
-EXCHANGE_SETTLEMENT_BUFFER_SEC = 5.0  # Gives Binance 5.0s to seal and publish the 15m candle
+HEARTBEAT_INTERVAL_SEC   = 10   # Silent background tick interval
+SETTLEMENT_BUFFER_SEC    = 5.0  # 5.0s buffer for Binance candle aggregation
 
-GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_TOKEN      = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
 BINANCE_KEY       = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
 BINANCE_SECRET    = os.environ.get("BINANCE_TESTNET_API_SECRET", "").strip()
@@ -95,10 +98,10 @@ BINANCE_PROXY     = os.environ.get("BINANCE_PROXY_URL", "").strip()
 # STEP 2: In-Memory Engine Initialization
 # =============================================================================
 print("===============================================================================")
-print("  EMA_TESTNET PRODUCTION DAEMON (AUTONOMOUS 5.5-HOUR WORKER)                   ")
+print("  EMA_TESTNET PRODUCTION DAEMON (SILENT HEARTBEAT & PURE CROSSOVER EXITS)      ")
 print(f"  Max Lifespan     : {MAX_RUN_DURATION_MINUTES} Minutes ({MAX_RUN_DURATION_MINUTES/60:.2f} Hours)")
+print(f"  Heartbeat Tick   : Every {HEARTBEAT_INTERVAL_SEC} Seconds (Silent Mode)                      ")
 print(f"  Target Repository: {GITHUB_REPOSITORY}                                       ")
-print(f"  Settlement Buffer: +{EXCHANGE_SETTLEMENT_BUFFER_SEC}s post candle close     ")
 print("===============================================================================\n")
 
 print("1. Initializing Telemetry and Database Connections...")
@@ -117,20 +120,18 @@ execution = ExecutionEngine(
 )
 
 ACTIVE_SYMBOLS = ["BTCUSDT", "DOGEUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+last_evaluated_15m_block = None
 
-# Idempotent State Tracker: Guards against duplicate evaluations caused by REST lag
-last_evaluated_candles = {sym: None for sym in ACTIVE_SYMBOLS}
-
-print("All engines initialized. Starting autonomous execution loop.\n")
+print("All systems initialized successfully. Continuous event loop active.\n")
 
 
 # =============================================================================
 # STEP 3: Self-Chaining Dispatcher (GitHub Actions REST API)
 # =============================================================================
 def dispatch_successor_workflow():
-    """Dispatches the next 5.5-hour workflow runner via GitHub REST API."""
+    """Dispatches next 5.5-hour workflow runner via GitHub Actions REST API."""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        print("[Warning] GITHUB_TOKEN or GITHUB_REPOSITORY missing. Cannot self-chain.")
+        print("[Warning] GITHUB_TOKEN/GH_PAT missing. Relying on scheduled cron triggers.")
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/workflows/runner.yml/dispatches"
@@ -144,40 +145,44 @@ def dispatch_successor_workflow():
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=15)
         if res.status_code in [204, 201, 200]:
-            print("Successfully triggered successor workflow! Handover initiated.")
+            print("Successfully dispatched successor workflow! Clean handover complete.")
             return True
         else:
-            print(f"[Self-Chaining Error] Dispatch returned HTTP {res.status_code}: {res.text}")
+            print(f"[Self-Chaining Notice] Dispatch returned HTTP {res.status_code}: {res.text}")
             return False
     except Exception as e:
-        print(f"[Self-Chaining Error] Failed to trigger successor: {repr(e)}")
+        print(f"[Self-Chaining Error] Dispatch exception: {repr(e)}")
         return False
 
 
 # =============================================================================
-# STEP 4: Position Maintenance Routine (Every 30 Seconds)
+# STEP 4: Silent In-Flight Position Maintenance (Emits Output Only on Events)
 # =============================================================================
 def run_position_maintenance():
-    """Polls in-flight orders, deploys brackets upon fill, and manages timeouts."""
+    """
+    Monitors in-flight orders silently every 10 seconds.
+    Emits terminal output ONLY when an action occurs (fill, timeout, or bracket exit).
+    """
     active_orders = telemetry.get_active_trades()
     if not active_orders:
         return
 
-    # Check for Limit Entry Fills & Deploy Native Brackets
+    # 1. Deploy native brackets for newly filled limit entry orders
     for trade in active_orders:
         if trade.get("order_status") == "PENDING_LIMIT":
             execution.check_and_deploy_brackets(trade)
 
-    # Cancel expired 15-minute limit entry orders
+    # 2. Cancel limit entry orders that exceeded 15 wall-clock minutes
     execution.handle_expired_limit_orders(max_timeout_minutes=15)
 
-    # Inspect FILLED orders against active Binance positions
+    # 3. Check for bracket fills (closures) on Binance
     live_positions = execution.get_active_positions()
     now_utc = datetime.now(timezone.utc)
 
     for trade in active_orders:
         if trade.get("order_status") == "FILLED":
             sym = trade["symbol"]
+            # With normalized keys ('SOLUSDT'), this check is strictly accurate
             if sym not in live_positions:
                 trade_id = trade["id"]
                 created_dt = pd.to_datetime(trade["created_at"], utc=True)
@@ -217,11 +222,14 @@ def run_position_maintenance():
 
 
 # =============================================================================
-# STEP 5: 15-Minute Pipeline (With Idempotent Deduplication Guard)
+# STEP 5: 15-Minute Pipeline (Pure Event-Driven Crossover Exits)
 # =============================================================================
 def run_candle_close_pipeline():
-    """Evaluates 9/15 crossovers, runs dual models, and routes orders or rejection logs."""
-    global last_evaluated_candles
+    """
+    Evaluates completed 15m candle close across the 5 assets.
+    Enforces Pure Crossover Exits: active trades terminate early IF AND ONLY IF
+    a formal, completed opposite 9/15 EMA crossover is registered.
+    """
     t_start = time.perf_counter()
     eval_time_str = datetime.now(timezone.utc).strftime('%H:%M:%S')
 
@@ -232,6 +240,7 @@ def run_candle_close_pipeline():
     free_cash = execution.get_free_usdt_balance()
     active_trades = telemetry.get_active_trades()
     active_by_symbol = {t["symbol"]: t for t in active_trades if t.get("order_status") in ["PENDING_LIMIT", "FILLED"]}
+    live_binance_positions = execution.get_active_positions()
 
     print(f"Active Slots Deployed: {len(active_by_symbol)} / 5 | Free Cash Available: ${free_cash:,.2f} USDT")
 
@@ -241,36 +250,56 @@ def run_candle_close_pipeline():
             df_4h  = fetch_closed_ohlcv(execution.exchange, symbol, '4h',  limit=40)
             df_1d  = fetch_closed_ohlcv(execution.exchange, symbol, '1d',  limit=25)
 
+            # Detect formal 9/15 EMA Crossover on completed candle [-1] vs [-2]
             signal, cross_price, candle_close_utc = detect_crossover(df_15m)
+
+            # ── PURE CROSSOVER EXIT ENFORCEMENT ──
+            # If NO crossover is registered on this bar, do nothing.
+            # Active trades remain protected by their resting TP and SL brackets.
             if not signal:
                 continue
 
-            # ── THE IDEMPOTENT DEDUPLICATION GUARD ──
-            # If the exchange REST API lagged and returned the same completed candle timestamp, skip it!
-            if last_evaluated_candles.get(symbol) == candle_close_utc:
-                print(f"[Idempotency Notice] {symbol} candle {candle_close_utc} already evaluated. Skipping duplicate query.")
-                continue
+            # Check if this asset is currently active in Supabase or live on Binance
+            has_db_trade = symbol in active_by_symbol
+            has_live_pos = symbol in live_binance_positions
 
-            # Mark this candle timestamp as processed
-            last_evaluated_candles[symbol] = candle_close_utc
+            if has_db_trade or has_live_pos:
+                active_record = active_by_symbol.get(symbol)
+                pos_dir = ""
+                if active_record:
+                    pos_dir = active_record["direction"].upper()
+                elif has_live_pos:
+                    pos_dir = live_binance_positions[symbol]["side"].upper()
+
+                # 1. Opposite Crossover Registered -> IMMEDIATE SIGNAL FLIP CLOSE!
+                if signal != pos_dir:
+                    print(f"\n[Crossover Reversal Detected] Confirmed {signal} crossover opposing active {pos_dir}! Liquidating immediately...")
+                    if active_record:
+                        execution.execute_signal_flip_close(active_record)
+                        del active_by_symbol[symbol]
+                    elif has_live_pos:
+                        # Orphaned position recovery: liquidate directly on Binance
+                        mock_trade = {
+                            "id": f"RECON_{int(time.time())}",
+                            "symbol": symbol,
+                            "direction": pos_dir,
+                            "contract_quantity": live_binance_positions[symbol]["contracts"],
+                            "limit_entry_price": live_binance_positions[symbol]["entry_price"],
+                            "actual_fill_price": live_binance_positions[symbol]["entry_price"],
+                            "allocated_cash": live_binance_positions[symbol]["contracts"] * live_binance_positions[symbol]["entry_price"],
+                            "created_at": datetime.now(timezone.utc).isoformat()
+                        }
+                        execution.execute_signal_flip_close(mock_trade)
+
+                    free_cash = execution.get_free_usdt_balance()
+                else:
+                    # Same-direction crossover on existing position -> Ignore (already entered)
+                    print(f"   --> {symbol} already positioned in {pos_dir}. Repeat signal ignored.")
+                    continue
 
             print(f"\n[Crossover Fired] {symbol} -> {signal} at ${cross_price:,.2f} (Candle Close: {candle_close_utc})")
 
-            # Signal-Flip Reversal Check
-            if symbol in active_by_symbol:
-                existing_trade = active_by_symbol[symbol]
-                existing_dir   = existing_trade["direction"].upper()
-
-                if signal != existing_dir:
-                    print(f"   --> Reverse signal detected! Initiating Signal-Flip Market Liquidation...")
-                    execution.execute_signal_flip_close(existing_trade)
-                    del active_by_symbol[symbol]
-                    free_cash = execution.get_free_usdt_balance()
-                else:
-                    print(f"   --> Same-direction signal ignored. Symbol {symbol} is already active.")
-                    continue
-
-            # Compute features & model predictions
+            # Extract 25 master indicators & compute dual-engine model predictions
             features_25 = compute_production_features(df_15m, df_4h, df_1d)
             recent_history = [features_25] * 30
             model_outputs  = model_registry.predict_trade_setup(symbol, signal, features_25, recent_history)
@@ -278,7 +307,7 @@ def run_candle_close_pipeline():
             print(f"   --> Predictions: Profit MFE={model_outputs['pred_profit_mfe']:.2f}% | Danger MAE={model_outputs['pred_danger_mae']:.2f}%")
             print(f"   --> Gates      : Prob(Profit)={model_outputs['prob_profit']:.3f} | Prob(Danger)={model_outputs['prob_danger']:.3f}")
 
-            # Gate policy evaluation
+            # Risk gates & asymmetrical parity hurdle (R:R >= 2.0)
             manifest = gates_engine.evaluate_gates_and_sizing(
                 symbol=symbol,
                 direction=signal,
@@ -296,7 +325,16 @@ def run_candle_close_pipeline():
                 trade_id = execution.execute_limit_entry(manifest, candle_close_utc)
                 print(f"       Order Dispatched! Trade UUID: {trade_id}")
 
-                active_by_symbol[symbol] = {"id": trade_id, "symbol": symbol, "direction": signal, "order_status": "PENDING_LIMIT"}
+                active_by_symbol[symbol] = {
+                    "id": trade_id,
+                    "symbol": symbol,
+                    "direction": signal,
+                    "order_status": "PENDING_LIMIT",
+                    "contract_quantity": manifest["contract_quantity"],
+                    "limit_entry_price": manifest["entry_price"],
+                    "allocated_cash": manifest["allocated_cash"],
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
                 free_cash = execution.get_free_usdt_balance()
             else:
                 print(f"   --> REJECTED: {manifest['rejection_reason']} (R:R = {manifest['rr_ratio']})")
@@ -311,20 +349,23 @@ def run_candle_close_pipeline():
 
 
 # =============================================================================
-# STEP 6: Autonomous 5.5-Hour Execution Loop with 5.0s Buffer
+# STEP 6: Master Continuous Heartbeat Loop (Silent Vigilance Mode)
 # =============================================================================
 def main():
-    """Master daemon execution loop governing scheduling, maintenance, and self-chaining."""
+    """
+    Master daemon loop. Polles maintenance silently every 10s and triggers
+    the 15-minute pipeline at T+5.0s past candle close.
+    """
+    global last_evaluated_15m_block
     daemon_start_time = time.time()
-    print(f"\n[Daemon Started] Autonomous 5.5-Hour loop active at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.")
-    last_processed_15m_block = None
+    print(f"[Daemon Started] Continuous Silent Heartbeat active at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.")
 
     while True:
         try:
             now_dt = datetime.now(timezone.utc)
             elapsed_minutes = (time.time() - daemon_start_time) / 60.0
 
-            # Self-Chaining Lifespan Check
+            # 1. Self-Chaining Lifespan Check at 320 Mins (5h 20m)
             if elapsed_minutes >= MAX_RUN_DURATION_MINUTES:
                 print(f"\n[Lifespan Reached] {elapsed_minutes:.1f} / {MAX_RUN_DURATION_MINUTES} Mins elapsed. Handover initiated.")
                 success = dispatch_successor_workflow()
@@ -332,37 +373,27 @@ def main():
                     time.sleep(15)
                     break
                 else:
-                    daemon_start_time += 900  # Extend 15m if dispatch fails
+                    daemon_start_time += 900
 
-            # Run 30-Second In-Flight Order Maintenance
+            # 2. Silent 10-Second In-Flight Order Maintenance (Outputs only on events)
             run_position_maintenance()
 
+            # 3. Surgical Candle Close Detection (At minute :00, :15, :30, :45 when second >= 5.0)
             current_minute = now_dt.minute
             current_second = now_dt.second
-            current_15m_block = current_minute // 15
+            current_15m_block = (now_dt.year, now_dt.month, now_dt.day, now_dt.hour, current_minute // 15)
 
-            seconds_into_15m = (current_minute % 15) * 60 + current_second
-            seconds_until_close = 900 - seconds_into_15m
+            is_candle_close_window = (current_minute % 15 == 0) and (current_second >= SETTLEMENT_BUFFER_SEC)
 
-            # Catch immediate edge cases right after candle close
-            if seconds_into_15m <= 15 and last_processed_15m_block != current_15m_block:
-                time.sleep(EXCHANGE_SETTLEMENT_BUFFER_SEC)
+            if is_candle_close_window and (last_evaluated_15m_block != current_15m_block):
                 run_candle_close_pipeline()
-                last_processed_15m_block = current_15m_block
-                continue
+                last_evaluated_15m_block = current_15m_block
 
-            # Sleep-to-close alignment with 5.0s settlement buffer
-            if seconds_until_close <= 150:
-                sleep_target = seconds_until_close + EXCHANGE_SETTLEMENT_BUFFER_SEC
-                print(f"[Timing Engine] Approaching 15m candle close. Sleeping {sleep_target:.1f}s to align with close...")
-                time.sleep(sleep_target)
-                run_candle_close_pipeline()
-                last_processed_15m_block = datetime.now(timezone.utc).minute // 15
-            else:
-                time.sleep(min(MAINTENANCE_INTERVAL_SEC, seconds_until_close - 150))
+            # 4. Silent Sleep for 10 Seconds (Always awake, zero console spam)
+            time.sleep(HEARTBEAT_INTERVAL_SEC)
 
         except Exception as e:
-            print(f"[Daemon Core Exception] Recovering: {repr(e)}")
+            print(f"[Daemon Heartbeat Exception] Recovering: {repr(e)}")
             time.sleep(10)
 
 

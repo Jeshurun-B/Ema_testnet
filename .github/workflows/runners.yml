@@ -1,17 +1,18 @@
 # ====================================================================================================
-# ALGORITHM: .github/workflows/runner.yml — Autonomous 5.5-Hour Self-Chaining Production Daemon
+# ALGORITHM: .github/workflows/runner.yml — Continuous Production Daemon with GH_PAT Dispatch
 # ====================================================================================================
 # Purpose:
-#   Run the autonomous trading daemon on GitHub Actions 24/7. Completely purges the broken Cloudflare
-#   WARP tunnel (which resolved to US IPs), exposes the non-US forward proxy secret (BINANCE_PROXY_URL),
-#   installs pinned dependencies (including pysocks), and executes main.py with unbuffered line output.
+#   Runs the 5.5-hour autonomous trading daemon on GitHub Actions. Exposes the Personal Access Token
+#   (GH_PAT) to authorize workflow dispatch calls for self-chaining, tunnels traffic through the
+#   German proxy secret (BINANCE_PROXY_URL), and ensures zero-downtime 24/7 cloud execution.
 #
 # Algorithm Steps:
-#   Step 1: Define Workflow Triggers (manual dispatch, 6-hour cron backup, and concurrency control).
-#   Step 2: Checkout Repository source code via actions/checkout@v4.
-#   Step 3: Setup Python 3.12 Runtime via actions/setup-python@v5.
-#   Step 4: Install Dependencies from requirements.txt (including pysocks for SOCKS5/HTTP proxy support).
-#   Step 5: Execute Autonomous Trading Daemon with full environment injection (BINANCE_PROXY_URL, API keys, Supabase).
+#   Step 1: Workflow Triggers: Manual dispatch & 6-hour cron failsafe.
+#   Step 2: Concurrency Lock: Ensures only one active trading worker runs per repository.
+#   Step 3: Repository Checkout: Pulls fresh code from the 'main' branch via actions/checkout@v4.
+#   Step 4: Python Runtime Setup: Installs Python 3.12 via actions/setup-python@v5.
+#   Step 5: Dependency Installation: Installs pinned requirements including pysocks.
+#   Step 6: Daemon Launch: Injects GH_PAT, proxy URL, Binance keys, and Supabase credentials into main.py.
 # ====================================================================================================
 
 name: EMA Testnet Production Daemon
@@ -33,26 +34,27 @@ jobs:
       actions: write
 
     steps:
-      # Step 2: Checkout Repository
+      # Step 3: Repository Checkout
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Step 3: Set up Python 3.12 Runtime
+      # Step 4: Setup Python 3.12 Runtime
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # Step 4: Install Production Dependencies (includes pysocks)
+      # Step 5: Install Production Dependencies
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Step 5: Run 5.5-Hour Self-Chaining Trading Engine with Proxy Tunnel
+      # Step 6: Launch Daemon with GH_PAT and Proxy Injection
       - name: Run 5.5-Hour Self-Chaining Trading Engine
         env:
           PYTHONUNBUFFERED: "1"
+          GH_PAT: ${{ secrets.GH_PAT }}
           BINANCE_PROXY_URL: ${{ secrets.BINANCE_PROXY_URL }}
           BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
           BINANCE_TESTNET_API_SECRET: ${{ secrets.BINANCE_TESTNET_API_SECRET }}

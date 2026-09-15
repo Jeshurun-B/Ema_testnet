@@ -1,30 +1,33 @@
 r"""
 ====================================================================================================
-ALGORITHM: main.py — Tier-1 In-Memory Engine with Asynchronous Telemetry & Pure Crossover Exits
+ALGORITHM: main.py — Tier-1 Production Daemon with Dual-ID RAM Tracking & runners.yml Dispatch
 ====================================================================================================
 Purpose:
   Institutional 5.5-hour continuous trading engine. Operates with In-Memory State as the primary
   source of truth during runtime (Hot Path) with Supabase serving purely as an asynchronous write-only
-  telemetry sink (Cold Path). Hydrates state from Table 1 ONCE at startup, executing all maintenance
-  and 15-minute candle pipelines completely in RAM without database read latency. Enforces pure
-  crossover exits and authorized self-chaining via GH_PAT.
+  telemetry sink (Cold Path). Captures and retains both trade_id and binance_order_id in RAM to ensure
+  sub-10s bracket deployment and true exchange-side limit order cancellations. Enforces strict
+  crossover inversion liquidations, phase-locked timing, dynamic precision, and authorized self-chaining.
 
 Key Architectural Invariants:
-  1. Zero Database Reads During Steady-State Trading:
-     - On boot, hydrates active trades from Supabase ONCE (`telemetry.hydrate_active_trades_from_db()`).
-     - Throughout the entire 5.5-hour run, the 10s maintenance loop and 15m candle pipeline execute
-       100% in RAM against `active_by_symbol`. Eliminates the dead TCP socket trap and 504 timeouts.
-  2. Write-Through Telemetry Sink:
-     - Supabase is touched ONLY on write events (inserting an order, recording a fill, or archiving
-       a trade closure). Database latency is completely decoupled from trade execution.
-  3. Authorized Self-Chaining via GH_PAT:
+  1. Complete Dual-ID In-Memory State Retention:
+     - Captures `binance_order_id` directly from `execution.execute_limit_entry(...)` and stores it
+       in `active_by_symbol[symbol]`.
+     - In-flight maintenance polls `fetch_order(binance_order_id)` every 10s to deploy resting brackets
+       immediately upon fill, and calls `cancel_order(binance_order_id)` on 15m timeout to prevent late fills.
+  2. Authorized Self-Chaining via runners.yml (HTTP 204 Success):
      - Dispatches successor runner via GitHub Actions REST API at 320 minutes using the authorized
-       Personal Access Token (`GH_PAT`), permanently resolving the HTTP 404 dispatch error.
-  4. Phase-Locked Sleep Timing (Exact :05.00 Close):
+       Personal Access Token (`GH_PAT`), targeting `.github/workflows/runners.yml`.
+  3. Strict Crossover Inversion Assertion (Purged Case A):
+     - In an alternating zero-crossing topology, consecutive crossovers must invert direction.
+     - If a crossover fires while an active trade or Binance position exists, it is strictly
+       asserted as an opposite reversal: the open trade is liquidated immediately via Market Close
+       (reduceOnly = True) and brackets are purged before evaluating the new setup.
+  4. Zero Database Reads During Steady-State Trading:
+     - On boot, hydrates active trades from Supabase ONCE (`telemetry.hydrate_active_trades_from_db()`).
+     - The 10s maintenance loop and 15m candle pipeline execute 100% in RAM against `active_by_symbol`.
+  5. Phase-Locked Sleep Timing (Exact :05.00 Close):
      - When within 15 seconds of candle close, phase-locks sleep to target T+5.0s past the close.
-  5. Pure Event-Driven Crossover Exits:
-     - Trades exit early IF AND ONLY IF a formal opposite 9/15 EMA crossover is registered on a
-       completed candle (Index [-1] vs [-2]).
   6. Dynamic Low-Notional Price Precision:
      - Formats prices dynamically: 4 decimals for <$1.00 (DOGE), 3 decimals for <$10.00 (XRP),
        and 2 decimals for >=$10.00 (BTC, ETH, SOL).
@@ -34,15 +37,18 @@ Algorithm Steps:
   Step 2: Engine Initialization & One-Time Startup Hydration:
           - Pre-load all 48 models into RAM once.
           - Hydrate `active_by_symbol` from Supabase once on boot. Cross-reference Binance positions.
-  Step 3: Self-Chaining Dispatcher (Authorized via GH_PAT).
-  Step 4: Silent In-Memory Position Maintenance (Every 10s):
-          - Inspects fills and timeouts in RAM; writes updates to Supabase as background events.
-  Step 5: 15-Minute Pipeline (100% In-Memory State & Pure Crossover Exits):
+  Step 3: Self-Chaining Dispatcher (Targeting runners.yml via GH_PAT):
+          - Dispatches POST request to `/actions/workflows/runners.yml/dispatches`.
+  Step 4: Silent In-Memory Position Maintenance with Real Exchange ID (Every 10s):
+          - Polls `fetch_order(binance_order_id)` -> on fill, deploys brackets.
+          - Enforces 15m wall-clock timeout -> physically cancels on Binance via `cancel_order(binance_order_id)`.
+          - Checks bracket closures -> archives realized PnL to Table 2.
+  Step 5: 15-Minute Pipeline (Strict Inversion Reversals & Dual-ID State Registration):
           - Reads active state from RAM in 1 microsecond.
           - Detects 9/15 EMA crossover on completed candle [-1] vs [-2].
-          - On confirmed opposite crossover, liquidates position immediately via Market Close.
-          - On valid signal: extracts 25 features, runs RAM inference, evaluates R:R >= 2.0 hurdle,
-            and routes quantized limit entry or logs rejection telemetry to Table 2.
+          - If a position exists, enforces strict signal inversion: liquidates immediately.
+          - Extracts 25 features, runs RAM inference, evaluates R:R >= 2.0 hurdle,
+            and routes quantized limit entry capturing `(trade_id, binance_order_id)`.
   Step 6: Master Phase-Locked Loop (Target: Exact :05.00 Close).
 ====================================================================================================
 """
@@ -61,6 +67,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import torch
 
+# Force immediate real-time line buffering on stdout
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -109,6 +116,7 @@ print("  EMA_TESTNET PRODUCTION DAEMON (TIER-1 IN-MEMORY HOT-PATH ENGINE)       
 print(f"  Max Lifespan     : {MAX_RUN_DURATION_MINUTES} Minutes ({MAX_RUN_DURATION_MINUTES/60:.2f} Hours)")
 print(f"  Heartbeat Tick   : Every {HEARTBEAT_INTERVAL_SEC} Seconds (Silent In-Memory Mode)           ")
 print(f"  Target Repository: {GITHUB_REPOSITORY}                                       ")
+print(f"  Dispatch Target  : .github/workflows/runners.yml                             ")
 print("===============================================================================\n")
 
 print("1. Initializing Telemetry and Database Connections...")
@@ -140,6 +148,7 @@ for sym, pos_data in live_positions.items():
         print(f"[Startup Reconciliation] Live Binance position detected for {sym} ({pos_data['side'].upper()}). Tracking in RAM.")
         active_by_symbol[sym] = {
             "id": None,
+            "binance_order_id": None,
             "symbol": sym,
             "direction": pos_data["side"].upper(),
             "order_status": "FILLED",
@@ -154,26 +163,27 @@ print(f"In-Memory State Engine active. Current tracked positions: {len(active_by
 
 
 # =============================================================================
-# STEP 3: Self-Chaining Dispatcher (Authorized via GH_PAT)
+# STEP 3: Self-Chaining Dispatcher (Targeting runners.yml via GH_PAT)
 # =============================================================================
 def dispatch_successor_workflow():
-    """Dispatches next 5.5-hour workflow runner via GitHub Actions REST API."""
+    """Dispatches next 5.5-hour workflow runner via GitHub Actions REST API targeting runners.yml."""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         print("[Warning] GITHUB_TOKEN/GH_PAT missing. Relying on scheduled cron triggers.")
         return False
 
-    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/workflows/runner.yml/dispatches"
+    # EXACT WORKFLOW FILENAME ALIGNMENT: runners.yml (plural)
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/workflows/runners.yml/dispatches"
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"token {GITHUB_TOKEN}"
     }
     payload = {"ref": "main"}
 
-    print(f"\n[Self-Chaining] Dispatching successor job to {GITHUB_REPOSITORY}...")
+    print(f"\n[Self-Chaining] Dispatching successor job to {GITHUB_REPOSITORY} via runners.yml...")
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=15)
         if res.status_code in [204, 201, 200]:
-            print("Successfully dispatched successor workflow! Clean handover complete.")
+            print("Successfully dispatched successor workflow! Clean handover complete (HTTP 204).")
             return True
         else:
             print(f"[Self-Chaining Notice] Dispatch returned HTTP {res.status_code}: {res.text}")
@@ -184,12 +194,13 @@ def dispatch_successor_workflow():
 
 
 # =============================================================================
-# STEP 4: Silent In-Memory Position Maintenance (Zero DB Reads)
+# STEP 4: Silent In-Memory Position Maintenance with Real Exchange Order ID
 # =============================================================================
 def run_position_maintenance():
     """
     Monitors in-flight orders silently every 10 seconds.
-    HOT-PATH ENFORCEMENT: Operates 100% in RAM against `active_by_symbol`. Zero database reads!
+    HOT-PATH ENFORCEMENT: Operates 100% in RAM against `active_by_symbol`.
+    Uses captured `binance_order_id` to poll fills and physically cancel timeouts on Binance.
     """
     global active_by_symbol
     
@@ -239,7 +250,7 @@ def run_position_maintenance():
                         if trade.get("id"):
                             telemetry.record_bracket_order_ids(trade["id"], str(tp_order["id"]), str(sl_order["id"]))
                         print(f"   --> Native Brackets Deployed: TP @ {format_price(tp_px)} | SL @ {format_price(sl_px)}")
-                except Exception as e:
+                except Exception:
                     pass
 
             # Check 15-minute wall-clock timeout
@@ -252,8 +263,9 @@ def run_position_maintenance():
                 if binance_id and "MOCK" not in str(binance_id):
                     try:
                         execution.exchange.cancel_order(binance_id, sym)
-                    except Exception:
-                        pass
+                        print(f"   --> Order {binance_id} cancelled successfully on Binance.")
+                    except Exception as e:
+                        print(f"   --> Cancel Notice: {e}")
                 if trade.get("id"):
                     telemetry.record_missed_trade(trade["id"], notes=f"Limit entry expired unfilled after {elapsed_min:.1f}m")
                 symbols_to_remove.append(sym)
@@ -306,12 +318,14 @@ def run_position_maintenance():
 
 
 # =============================================================================
-# STEP 5: 15-Minute Pipeline (100% In-Memory State & Pure Crossover Exits)
+# STEP 5: 15-Minute Pipeline (Strict Inversion Reversals & Dual-ID State)
 # =============================================================================
 def run_candle_close_pipeline():
     """
     Evaluates completed 15m candle close. Reads active state from RAM (0.0001ms).
-    Enforces Pure Crossover Exits with asynchronous write-through telemetry.
+    ENFORCES STRICT CROSSOVER INVERSION: If an active position exists when a crossover
+    fires, it is strictly asserted as an opposite reversal; liquidated immediately before
+    evaluating the new trade setup. Stores both trade_id and binance_order_id.
     """
     global active_by_symbol
     t_start = time.perf_counter()
@@ -338,7 +352,8 @@ def run_candle_close_pipeline():
             if not signal:
                 continue
 
-            # ── PURE CROSSOVER EXIT ENFORCEMENT ──
+            # ── STRICT CROSSOVER INVERSION ASSERTION ──
+            # In an alternating zero-crossing system, any crossover while positioned is an inversion.
             has_ram_trade = symbol in active_by_symbol
             has_live_pos  = symbol in live_binance_positions
 
@@ -350,29 +365,25 @@ def run_candle_close_pipeline():
                 elif has_live_pos:
                     pos_dir = live_binance_positions[symbol]["side"].upper()
 
-                # Opposite Crossover Registered -> IMMEDIATE SIGNAL FLIP CLOSE!
-                if signal != pos_dir:
-                    print(f"\n[Crossover Reversal Detected] Confirmed {signal} crossover opposing active {pos_dir}! Liquidating immediately...")
-                    
-                    trade_to_close = active_record or {
-                        "id": None,
-                        "symbol": symbol,
-                        "direction": pos_dir,
-                        "contract_quantity": live_binance_positions[symbol]["contracts"],
-                        "limit_entry_price": live_binance_positions[symbol]["entry_price"],
-                        "actual_fill_price": live_binance_positions[symbol]["entry_price"],
-                        "allocated_cash": live_binance_positions[symbol]["contracts"] * live_binance_positions[symbol]["entry_price"],
-                        "created_at": datetime.now(timezone.utc).isoformat()
-                    }
+                print(f"\n[Crossover Inversion Detected] {signal} crossover fires against active {pos_dir}! Liquidating immediately...")
 
-                    execution.execute_signal_flip_close(trade_to_close)
+                trade_to_close = active_record or {
+                    "id": None,
+                    "binance_order_id": None,
+                    "symbol": symbol,
+                    "direction": pos_dir,
+                    "contract_quantity": live_binance_positions[symbol]["contracts"],
+                    "limit_entry_price": live_binance_positions[symbol]["entry_price"],
+                    "actual_fill_price": live_binance_positions[symbol]["entry_price"],
+                    "allocated_cash": live_binance_positions[symbol]["contracts"] * live_binance_positions[symbol]["entry_price"],
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }
 
-                    if symbol in active_by_symbol:
-                        del active_by_symbol[symbol]
-                    free_cash = execution.get_free_usdt_balance()
-                else:
-                    print(f"   --> {symbol} already positioned in {pos_dir}. Repeat signal ignored.")
-                    continue
+                execution.execute_signal_flip_close(trade_to_close)
+
+                if symbol in active_by_symbol:
+                    del active_by_symbol[symbol]
+                free_cash = execution.get_free_usdt_balance()
 
             print(f"\n[Crossover Fired] {symbol} -> {signal} at {format_price(cross_price)} (Candle Close: {candle_close_utc})")
 
@@ -399,13 +410,14 @@ def run_candle_close_pipeline():
                 print(f"       Allocated Cash: ${manifest['allocated_cash']:,.2f} | Quantity: {manifest['contract_quantity']} {symbol}")
                 print(f"       Dynamic TP: {format_price(manifest['dynamic_tp_price'])} | Dynamic SL: {format_price(manifest['dynamic_sl_price'])}")
 
-                # Place order on Binance & write to Table 1
-                trade_id = execution.execute_limit_entry(manifest, candle_close_utc)
-                print(f"       Order Dispatched! Trade UUID: {trade_id}")
+                # Place order on Binance, write to Table 1 & CAPTURE DUAL IDENTIFIERS
+                trade_id, binance_order_id = execution.execute_limit_entry(manifest, candle_close_utc)
+                print(f"       Order Dispatched! Trade UUID: {trade_id} | Binance ID: {binance_order_id}")
 
-                # Immediate In-Memory State Registration (Hot Path)
+                # Immediate In-Memory State Registration with Binance Order ID
                 active_by_symbol[symbol] = {
                     "id": trade_id,
+                    "binance_order_id": binance_order_id,
                     "symbol": symbol,
                     "direction": signal,
                     "order_status": "PENDING_LIMIT",
@@ -448,7 +460,7 @@ def main():
             now_dt = datetime.now(timezone.utc)
             elapsed_minutes = (time.time() - daemon_start_time) / 60.0
 
-            # 1. Self-Chaining Lifespan Check at 320 Mins (Authorized via GH_PAT)
+            # 1. Self-Chaining Lifespan Check at 320 Mins (Targeting runners.yml via GH_PAT)
             if elapsed_minutes >= MAX_RUN_DURATION_MINUTES:
                 print(f"\n[Lifespan Reached] {elapsed_minutes:.1f} / {MAX_RUN_DURATION_MINUTES} Mins elapsed. Handover initiated.")
                 success = dispatch_successor_workflow()

@@ -1,26 +1,30 @@
 """
 ====================================================================================================
-ALGORITHM: src/execution.py — Production Order Routing Engine with Dual-ID Return
+ALGORITHM: src/execution.py — Institutional Order Routing Engine with Mark Price Protection
 ====================================================================================================
 Purpose:
-  Institutional exchange connector to Binance Futures Testnet via CCXT. Returns both the Supabase
-  UUID (trade_id) and the Binance matching engine order ID (binance_order_id) to eliminate phantom
-  cancellations. Enforces CCXT symbol normalization (stripping ':USDT' to cure phantom SL bugs),
-  wall-clock timeout tracking via `created_at`, proxy sanitization, and ghost bracket annihilation.
+  Institutional exchange connector to Binance Futures Testnet via CCXT. Eliminates rogue order-book
+  liquidity sweeps by explicitly pegging native TP/SL brackets to `MARK_PRICE` rather than local
+  contract last price. Returns dual identifiers (trade_id, binance_order_id), enforces CCXT symbol
+  normalization (stripping ':USDT'), measures wall-clock timeouts via `created_at`, sanitizes forward
+  proxies, and purges ghost brackets upon signal flips.
 
 Key Microstructure & Routing Invariants:
-  1. Dual Identifier Return (trade_id, binance_order_id):
-     - `execute_limit_entry()` returns both the internal Supabase UUID and the exchange's numeric
-       order ID, ensuring the in-memory maintenance loop can track fills and physically cancel
-       unfilled orders on Binance.
-  2. Universal Symbol Normalization:
-     - Normalizes CCXT symbols by stripping unified suffixes (`:USDT` and `/`), guaranteeing that
-       exchange position queries match internal asset keys (e.g., 'SOLUSDT', 'DOGEUSDT').
-  3. Ghost Bracket Annihilation:
-     - Signal flips execute `exchange.cancel_all_orders(symbol)` to purge all resting brackets
-       on the Binance matching engine before market liquidation.
-  4. Proxy URI Sanitization:
-     - Enforces `http://` scheme to prevent OpenSSL `[SSL: WRONG_VERSION_NUMBER]` crashes.
+  1. Mark Price Trigger Protection (`workingType: 'MARK_PRICE'`):
+     - Injects `workingType: 'MARK_PRICE'` into both TAKE_PROFIT_MARKET and STOP_MARKET orders.
+     - Protects positions against thin order-book illiquidity, fat-finger fills, and testnet air-pocket
+       wicks by pegging bracket triggers strictly to the consolidated spot index rather than local fills.
+  2. Dual Identifier Return (trade_id, binance_order_id):
+     - Returns both the Supabase UUID and the Binance matching engine order ID to ensure that in-flight
+       maintenance can poll fills in real time and physically cancel timed-out limit orders on the exchange.
+  3. Universal CCXT Symbol Normalization:
+     - Strips unified CCXT suffixes (`:USDT` and `/`), ensuring that exchange position queries map
+       identically to internal database keys (e.g., 'SOLUSDT', 'BTCUSDT').
+  4. Ghost Bracket Annihilation:
+     - Signal flips execute `exchange.cancel_all_orders(symbol)` to purge all resting brackets on the
+       Binance matching engine before market liquidation.
+  5. Proxy URI Sanitization:
+     - Enforces `http://` scheme to prevent OpenSSL `[SSL: WRONG_VERSION_NUMBER]` protocol crashes.
 
 Algorithm Steps:
   Step 1: Module Setup, Safe Math & Dependency Ingestion (including pandas as pd).
@@ -39,8 +43,9 @@ Algorithm Steps:
           - Dispatches quantized limit entry order at crossover close price.
           - Records trade in Supabase Table 1 as 'PENDING_LIMIT'.
           - Returns tuple: `(trade_id, binance_order_id)`.
-  Step 8: Native 2-Stage Bracket Deployment (`check_and_deploy_brackets`):
-          - When limit entry fills, deploys resting reduce-only TAKE_PROFIT_MARKET and STOP_MARKET orders.
+  Step 8: Native 2-Stage Bracket Deployment with Mark Price Protection (`check_and_deploy_brackets`):
+          - When limit entry fills, deploys resting reduce-only TAKE_PROFIT_MARKET and STOP_MARKET
+            orders pegged strictly to `workingType: 'MARK_PRICE'`.
   Step 9: Wall-Clock Order Timeout Handler (`handle_expired_limit_orders`):
           - Cancels unfilled limit orders older than 15 wall-clock minutes; archives to Table 2.
   Step 10: Signal-Flip Liquidation with Ghost Bracket Annihilation:
@@ -108,7 +113,7 @@ def sanitize_proxy_url(url: str) -> str:
 class ExecutionEngine:
     """
     Hardened CCXT connector managing order routing, symbol normalization,
-    wall-clock timeouts, dual-ID returns, and ghost bracket annihilation.
+    wall-clock timeouts, dual-ID returns, and Mark Price bracket triggers.
     """
     def __init__(
         self,
@@ -316,14 +321,16 @@ class ExecutionEngine:
             binance_order_id=binance_order_id
         )
 
-        # Returns both internal UUID and external exchange ID to eliminate phantom cancellations
         return trade_id, binance_order_id
 
     # =========================================================================
-    # STEP 8: Native Bracket Deployment
+    # STEP 8: Native Bracket Deployment with Mark Price Protection
     # =========================================================================
     def check_and_deploy_brackets(self, trade_record: dict):
-        """Polls Binance for entry fill. Upon fill, deploys native resting brackets."""
+        """
+        Polls Binance for entry fill. Upon fill, deploys native resting brackets
+        pegged strictly to workingType: 'MARK_PRICE' to eliminate order-book air pockets.
+        """
         trade_id   = trade_record["id"]
         symbol     = trade_record["symbol"]
         direction  = trade_record["direction"].upper()
@@ -339,7 +346,7 @@ class ExecutionEngine:
 
             if status == 'closed':
                 actual_fill = float(order_info.get('average') or order_info.get('price') or trade_record["limit_entry_price"])
-                print(f"[Order Fill Detected] {symbol} {direction} filled at ${actual_fill}. Deploying resting brackets...")
+                print(f"[Order Fill Detected] {symbol} {direction} filled at ${actual_fill}. Deploying resting brackets (MARK_PRICE protected)...")
                 
                 self.telemetry.record_order_fill(trade_id, actual_fill)
 
@@ -350,24 +357,34 @@ class ExecutionEngine:
 
                 close_side = 'sell' if direction == 'LONG' else 'buy'
 
+                # Native TAKE_PROFIT_MARKET pegged strictly to MARK_PRICE
                 tp_order = self.exchange.create_order(
                     symbol=symbol,
                     type='TAKE_PROFIT_MARKET',
                     side=close_side,
                     amount=qty,
-                    params={'stopPrice': clean_tp_price, 'reduceOnly': True}
+                    params={
+                        'stopPrice': clean_tp_price,
+                        'reduceOnly': True,
+                        'workingType': 'MARK_PRICE'
+                    }
                 )
 
+                # Native STOP_MARKET pegged strictly to MARK_PRICE
                 sl_order = self.exchange.create_order(
                     symbol=symbol,
                     type='STOP_MARKET',
                     side=close_side,
                     amount=qty,
-                    params={'stopPrice': clean_sl_price, 'reduceOnly': True}
+                    params={
+                        'stopPrice': clean_sl_price,
+                        'reduceOnly': True,
+                        'workingType': 'MARK_PRICE'
+                    }
                 )
 
                 self.telemetry.record_bracket_order_ids(trade_id, str(tp_order['id']), str(sl_order['id']))
-                print(f"   --> Native Brackets Deployed: TP @ ${clean_tp_price} | SL @ ${clean_sl_price}")
+                print(f"   --> Native Brackets Deployed: TP @ ${clean_tp_price} | SL @ ${clean_sl_price} [workingType: MARK_PRICE]")
 
         except Exception as e:
             print(f"[Execution Error] Failed to deploy brackets for {symbol}: {repr(e)}")
@@ -401,6 +418,7 @@ class ExecutionEngine:
                 if self.api_key and self.api_secret and binance_id and "MOCK" not in str(binance_id):
                     try:
                         self.exchange.cancel_order(binance_id, symbol)
+                        print(f"   --> Order {binance_id} cancelled successfully on Binance.")
                     except Exception as e:
                         print(f"   --> Cancel Notice: {e}")
 

@@ -1,56 +1,31 @@
 """
 ====================================================================================================
-ALGORITHM: src/execution.py — Institutional Order Routing Engine with Mark Price Protection
+ALGORITHM: src/execution.py — Institutional Order Routing Engine with Mark Price & Dual-ID Return
 ====================================================================================================
 Purpose:
-  Institutional exchange connector to Binance Futures Testnet via CCXT. Eliminates rogue order-book
-  liquidity sweeps by explicitly pegging native TP/SL brackets to `MARK_PRICE` rather than local
-  contract last price. Returns dual identifiers (trade_id, binance_order_id), enforces CCXT symbol
-  normalization (stripping ':USDT'), measures wall-clock timeouts via `created_at`, sanitizes forward
-  proxies, and purges ghost brackets upon signal flips.
-
-Key Microstructure & Routing Invariants:
-  1. Mark Price Trigger Protection (`workingType: 'MARK_PRICE'`):
-     - Injects `workingType: 'MARK_PRICE'` into both TAKE_PROFIT_MARKET and STOP_MARKET orders.
-     - Protects positions against thin order-book illiquidity, fat-finger fills, and testnet air-pocket
-       wicks by pegging bracket triggers strictly to the consolidated spot index rather than local fills.
-  2. Dual Identifier Return (trade_id, binance_order_id):
-     - Returns both the Supabase UUID and the Binance matching engine order ID to ensure that in-flight
-       maintenance can poll fills in real time and physically cancel timed-out limit orders on the exchange.
-  3. Universal CCXT Symbol Normalization:
-     - Strips unified CCXT suffixes (`:USDT` and `/`), ensuring that exchange position queries map
-       identically to internal database keys (e.g., 'SOLUSDT', 'BTCUSDT').
-  4. Ghost Bracket Annihilation:
-     - Signal flips execute `exchange.cancel_all_orders(symbol)` to purge all resting brackets on the
-       Binance matching engine before market liquidation.
-  5. Proxy URI Sanitization:
-     - Enforces `http://` scheme to prevent OpenSSL `[SSL: WRONG_VERSION_NUMBER]` protocol crashes.
+  Institutional exchange connector to Binance Futures Testnet via CCXT. Explicitly sets native
+  brackets to `workingType: 'MARK_PRICE'` to eliminate local order-book liquidity sweeps. Returns
+  both `(trade_id, binance_order_id)` on limit entries to allow precise order tracking. Normalizes
+  symbols (stripping ':USDT'), measures wall-clock timeouts via `created_at`, suppresses benign
+  margin mode notices (code -4067), and annihilates ghost brackets on signal flips.
 
 Algorithm Steps:
   Step 1: Module Setup, Safe Math & Dependency Ingestion (including pandas as pd).
   Step 2: Proxy URI Sanitization Utility.
-  Step 3: CCXT Client Initialization & Pre-Flight Handshake:
-          - Configure `ccxt.binanceusdm` with proxy tunnel, rate limiting, and time diff adjustment.
-          - Route via `enable_demo_trading(True)`. Verify external IP via pre-flight probe.
-  Step 4: Account Capital & Normalized Position Discovery:
-          - `get_free_usdt_balance()`: Queries wallet for available free USDT margin.
-          - `get_active_positions()`: Normalizes contract symbols to clean pairs (e.g., 'BTCUSDT').
-  Step 5: Precision Quantization & minNotional Compliance:
-          - Formats size to stepSize and price to tickSize; enforces 5.0 USDT floor.
-  Step 6: Isolated Margin & 1.0x Leverage Configuration:
-          - Enforces 'ISOLATED' margin mode and 1.0x unleveraged capital policy.
-  Step 7: Limit Entry Order Dispatch (Dual-ID Return):
-          - Dispatches quantized limit entry order at crossover close price.
+  Step 3: CCXT Client Initialization & Pre-Flight Handshake (enable_demo_trading).
+  Step 4: Account Capital & Normalized Position Discovery (get_active_positions).
+  Step 5: Precision Quantization & minNotional Compliance (5.0 USDT floor).
+  Step 6: Isolated Margin & 1.0x Leverage Configuration (Suppresses code -4067).
+  Step 7: Limit Entry Order Dispatch:
+          - Places quantized limit entry on Binance.
           - Records trade in Supabase Table 1 as 'PENDING_LIMIT'.
           - Returns tuple: `(trade_id, binance_order_id)`.
-  Step 8: Native 2-Stage Bracket Deployment with Mark Price Protection (`check_and_deploy_brackets`):
-          - When limit entry fills, deploys resting reduce-only TAKE_PROFIT_MARKET and STOP_MARKET
-            orders pegged strictly to `workingType: 'MARK_PRICE'`.
-  Step 9: Wall-Clock Order Timeout Handler (`handle_expired_limit_orders`):
-          - Cancels unfilled limit orders older than 15 wall-clock minutes; archives to Table 2.
+  Step 8: Native Bracket Deployment with Mark Price Protection:
+          - Submits TAKE_PROFIT_MARKET and STOP_MARKET with `workingType: 'MARK_PRICE'`.
+  Step 9: Wall-Clock Order Timeout Handler:
+          - Cancels unfilled limit orders older than 15 wall-clock minutes.
   Step 10: Signal-Flip Liquidation with Ghost Bracket Annihilation:
-          - Purges resting brackets via `cancel_all_orders(symbol)`.
-          - Submits immediate Market Close order (reduceOnly = True) and archives to Table 2.
+          - Cancels all resting orders on symbol before market close (reduceOnly=True).
   Step 11: Integration Self-Test Probe (`if __name__ == '__main__'`).
 ====================================================================================================
 """
@@ -111,10 +86,6 @@ def sanitize_proxy_url(url: str) -> str:
 # STEP 3: CCXT Client Initialization & Pre-Flight Handshake
 # =============================================================================
 class ExecutionEngine:
-    """
-    Hardened CCXT connector managing order routing, symbol normalization,
-    wall-clock timeouts, dual-ID returns, and Mark Price bracket triggers.
-    """
     def __init__(
         self,
         api_key: str = API_KEY,
@@ -149,7 +120,6 @@ class ExecutionEngine:
 
         self.exchange = ccxt.binanceusdm(exchange_config)
 
-        # Testnet routing
         if hasattr(self.exchange, "enable_demo_trading"):
             self.exchange.enable_demo_trading(True)
         elif hasattr(self.exchange, "enableDemoTrading"):
@@ -199,10 +169,7 @@ class ExecutionEngine:
             return 10000.0
 
     def get_active_positions(self) -> dict:
-        """
-        Fetches all open positions on Binance Futures with non-zero contracts.
-        NORMALIZATION ENFORCEMENT: Strips '/USDT:USDT' and ':USDT' so keys match 'BTCUSDT'.
-        """
+        """Fetches all open positions on Binance Futures with non-zero contracts."""
         if not self.api_key or not self.api_secret:
             return {}
         try:
@@ -246,10 +213,10 @@ class ExecutionEngine:
         return clean_price, clean_qty
 
     # =========================================================================
-    # STEP 6: Isolated Margin & 1.0x Leverage Setup
+    # STEP 6: Isolated Margin & 1.0x Leverage Setup (Suppresses Error -4067)
     # =========================================================================
     def setup_symbol_isolated_1x(self, symbol: str):
-        """Configures asset to ISOLATED margin mode and 1.0x leverage."""
+        """Configures asset to ISOLATED margin mode and 1.0x leverage silently."""
         if not self.api_key or not self.api_secret:
             return
 
@@ -257,24 +224,22 @@ class ExecutionEngine:
             self.exchange.set_margin_mode('ISOLATED', symbol)
         except Exception as e:
             err_msg = str(e).lower()
-            if "no need to change" not in err_msg and "already" not in err_msg:
-                print(f"[Execution Notice] Margin mode for {symbol}: {e}")
+            # Silently catch benign notices: already isolated, no need to change, or open orders exist (-4067)
+            if "-4067" not in err_msg and "no need to change" not in err_msg and "already" not in err_msg:
+                print(f"[Execution Notice] Margin mode setting for {symbol}: {e}")
 
         try:
             self.exchange.set_leverage(1, symbol)
         except Exception as e:
             err_msg = str(e).lower()
             if "not modified" not in err_msg:
-                print(f"[Execution Notice] Leverage for {symbol}: {e}")
+                print(f"[Execution Notice] Leverage setting for {symbol}: {e}")
 
     # =========================================================================
     # STEP 7: Limit Entry Order Placement (Returns trade_id, binance_order_id)
     # =========================================================================
     def execute_limit_entry(self, manifest: dict, candle_close_utc: str):
-        """
-        Places quantized limit entry on Binance and records to Supabase Table 1.
-        RETURNS: tuple (trade_id: str, binance_order_id: str).
-        """
+        """Places quantized limit entry and returns tuple (trade_id, binance_order_id)."""
         symbol         = manifest["symbol"]
         direction      = manifest["direction"].upper()
         entry_price    = manifest["entry_price"]
@@ -327,10 +292,7 @@ class ExecutionEngine:
     # STEP 8: Native Bracket Deployment with Mark Price Protection
     # =========================================================================
     def check_and_deploy_brackets(self, trade_record: dict):
-        """
-        Polls Binance for entry fill. Upon fill, deploys native resting brackets
-        pegged strictly to workingType: 'MARK_PRICE' to eliminate order-book air pockets.
-        """
+        """Deploys resting brackets pegged strictly to workingType: 'MARK_PRICE'."""
         trade_id   = trade_record["id"]
         symbol     = trade_record["symbol"]
         direction  = trade_record["direction"].upper()
@@ -390,7 +352,7 @@ class ExecutionEngine:
             print(f"[Execution Error] Failed to deploy brackets for {symbol}: {repr(e)}")
 
     # =========================================================================
-    # STEP 9: Wall-Clock Order Timeout Cancellation (Exact 15 Minutes)
+    # STEP 9: Wall-Clock Order Timeout Cancellation
     # =========================================================================
     def handle_expired_limit_orders(self, max_timeout_minutes: int = 15):
         """Cancels limit orders older than 15.0 wall-clock minutes."""

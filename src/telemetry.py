@@ -8,39 +8,17 @@ Purpose:
   runtime, functions purely as an asynchronous write-through telemetry sink for orders, fills,
   closures, and gate rejection audits.
 
-Key Architectural Invariants:
-  1. One-Time Startup Hydration:
-     - `hydrate_active_trades_from_db()` executes strictly once upon daemon boot to recover open
-       positions across runner handovers. Zero SELECT queries are made during steady-state trading.
-  2. Safe Orphaned Reconciliation Archiving:
-     - `record_trade_closure()` gracefully handles trades that were opened outside of Table 1,
-       archiving them directly to Table 2 (`testnet_trade_log`) with `trade_id = None` without
-       raising PostgreSQL UUID syntax or missing foreign key exceptions.
-  3. Exponential Backoff on Writes:
-     - All write operations (INSERT, UPDATE) use `_execute_with_retry` (3 attempts, 2.0s -> 4.0s -> 8.0s)
-       to absorb transient gateway latency without dropping audit records.
-
 Algorithm Steps:
   Step 1: Module Setup, Client Ingestion & Environment Configuration.
-  Step 2: TelemetryEngine Initialization.
-  Step 3: Resilient Execution Wrapper (`_execute_with_retry`).
-  Step 4: Startup Hydration Handler (`hydrate_active_trades_from_db`):
-          - Queries Table 1 once on boot to populate in-memory state.
-  Step 5: Write-Through State Machine Handlers:
-          - `record_new_order()`: Inserts limit order into Table 1, returning generated UUID.
-          - `record_order_fill()`: Updates Table 1 status to FILLED with actual fill price.
-          - `record_bracket_order_ids()`: Persists native Binance TP and SL order IDs.
-  Step 6: Forensic Archive & Rejection Handlers:
-          - `record_trade_closure()`: Archives closed trades to Table 2, calculating friction loss.
-          - `record_missed_trade()`: Archives expired limit orders as MISSED_TRADE.
-          - `record_rejected_signal()`: Appends filtered trade setups to Table 2 as GATE_REJECTED.
+  Step 2: TelemetryEngine Class Definition.
+  Step 3: Resilient Write Wrapper (`_execute_with_retry`).
+  Step 4: Startup Hydration Handler (`hydrate_active_trades_from_db`).
+  Step 5: Write-Through State Machine Handlers (record_new_order, record_order_fill, record_bracket_order_ids).
+  Step 6: Forensic Archive & Rejection Handlers (record_trade_closure, record_missed_trade, record_rejected_signal).
   Step 7: Built-In Integration Self-Test (`if __name__ == '__main__'`).
 ====================================================================================================
 """
 
-# =============================================================================
-# STEP 1: Module Setup & Credentials Ingestion
-# =============================================================================
 import os
 import time
 from datetime import datetime, timezone
@@ -64,9 +42,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# =============================================================================
-# STEP 2 & 3: TelemetryEngine Class & Resilient Write Wrapper
-# =============================================================================
 class TelemetryEngine:
     def __init__(self, client: Client = supabase):
         self.db = client
@@ -74,7 +49,6 @@ class TelemetryEngine:
         self.log_table    = "testnet_trade_log"
 
     def _execute_with_retry(self, operation_fn, max_retries: int = 3, initial_delay: float = 2.0):
-        """Executes a database lambda with exponential backoff on transient errors."""
         delay = initial_delay
         last_exception = None
 
@@ -85,7 +59,6 @@ class TelemetryEngine:
                 last_exception = e
                 err_str = str(e).lower()
                 if "504" in err_str or "timeout" in err_str or "connection" in err_str:
-                    print(f"[Supabase Notice] Network glitch on attempt {attempt}/{max_retries}. Retrying in {delay:.1f}s...")
                     time.sleep(delay)
                     delay *= 2.0
                 else:
@@ -93,15 +66,8 @@ class TelemetryEngine:
 
         raise last_exception
 
-    # =========================================================================
-    # STEP 4: One-Time Startup Hydration Handler (Called ONCE on Boot)
-    # =========================================================================
     def hydrate_active_trades_from_db(self) -> dict:
-        """
-        Queries Table 1 ONCE upon daemon boot to hydrate in-memory state across
-        runner handovers. Returns a dict keyed by symbol: {'BTCUSDT': {...}, ...}.
-        Zero SELECT queries are executed during steady-state trading.
-        """
+        """Queries Table 1 ONCE upon daemon boot. Zero SELECT queries during steady-state trading."""
         try:
             def op():
                 return self.db.table(self.active_table).select("*").in_("order_status", ["PENDING_LIMIT", "FILLED"]).execute()
@@ -114,9 +80,6 @@ class TelemetryEngine:
             print(f"[State Hydration Warning] Could not hydrate state from Supabase ({e}). Starting with empty cache.")
             return {}
 
-    # =========================================================================
-    # STEP 5: Write-Through State Machine Handlers
-    # =========================================================================
     def record_new_order(
         self,
         symbol: str,
@@ -168,7 +131,7 @@ class TelemetryEngine:
         try:
             self._execute_with_retry(op, max_retries=3)
         except Exception as e:
-            print(f"[Telemetry Warning] Could not record order fill in DB ({e}). Continuing.")
+            print(f"[Telemetry Warning] Could not record fill in DB ({e}). Continuing.")
 
     def record_bracket_order_ids(self, trade_id: str, binance_tp_id: str, binance_sl_id: str):
         payload = {
@@ -182,9 +145,6 @@ class TelemetryEngine:
         except Exception as e:
             print(f"[Telemetry Warning] Could not record bracket IDs in DB ({e}). Continuing.")
 
-    # =========================================================================
-    # STEP 6: Forensic Archive & Rejection Handlers
-    # =========================================================================
     def record_trade_closure(
         self,
         trade_id: str,
@@ -200,7 +160,6 @@ class TelemetryEngine:
         direction: str = None,
         entry_price: float = None
     ):
-        """Archives closed trade to Table 2. Gracefully handles orphaned positions."""
         trade = None
         if trade_id:
             try:
@@ -234,7 +193,6 @@ class TelemetryEngine:
             "notes": notes or f"Closed via {close_reason}"
         }
 
-        # 1. Insert into Table 2
         try:
             def insert_op():
                 return self.db.table(self.log_table).insert(log_payload).execute()
@@ -242,7 +200,6 @@ class TelemetryEngine:
         except Exception as e:
             print(f"[Telemetry Warning] Could not write trade log to DB ({e}). Continuing.")
 
-        # 2. Update Table 1 to CLOSED if active record exists
         if trade:
             try:
                 def update_op():
@@ -252,7 +209,6 @@ class TelemetryEngine:
                 pass
 
     def record_missed_trade(self, trade_id: str, notes: str = "Limit entry expired unfilled after 15m"):
-        """Archives expired limit orders as MISSED_TRADE."""
         trade = None
         if trade_id:
             try:
@@ -296,7 +252,6 @@ class TelemetryEngine:
             print(f"[Telemetry Warning] Could not record missed trade in DB ({e}). Continuing.")
 
     def record_rejected_signal(self, symbol: str, direction: str, signal_price: float, manifest: dict):
-        """Logs filtered/rejected trade signals directly to Table 2."""
         notes_str = f"{manifest.get('rejection_reason', 'REJECTED')} | Tag: {manifest.get('gate_combo_tag', 'N/A')} | R:R: {manifest.get('rr_ratio', 0.0)}"
         log_payload = {
             "trade_id": None,
@@ -321,18 +276,3 @@ class TelemetryEngine:
             self._execute_with_retry(insert_op, max_retries=3)
         except Exception as e:
             print(f"[Telemetry Warning] Could not record rejection to DB ({e}). Continuing.")
-
-
-# =============================================================================
-# STEP 7: Built-In Integration Self-Test
-# =============================================================================
-RUN_TELEMETRY_SELF_TEST = True
-
-if __name__ == "__main__" and RUN_TELEMETRY_SELF_TEST:
-    print("===============================================================================")
-    print("  TESTING HYDRATION & WRITE-THROUGH TELEMETRY (src/telemetry.py)               ")
-    print("===============================================================================")
-    engine = TelemetryEngine()
-    cache = engine.hydrate_active_trades_from_db()
-    print(f"  Connected successfully. Hydrated active trades in memory: {len(cache)}")
-    print("===============================================================================")

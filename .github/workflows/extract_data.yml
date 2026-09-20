@@ -1,0 +1,75 @@
+# ====================================================================================================
+# ALGORITHM: .github/workflows/extract_data.yml — Manual Binance Extraction & Git Commit Workflow
+# ====================================================================================================
+# Purpose:
+#   Manual one-shot GitHub Actions workflow that executes `src/extract_binance_ground_truth.py`.
+#   Scrapes the 3 Binance Futures API ledgers through the Frankfurt proxy, resets Supabase Table 1,
+#   repopulates Table 2 directly from the exchange API, and commits the extracted CSV artifacts
+#   directly back to the repository's `main` branch under `data/ground_truth/`.
+#
+# Algorithm Steps:
+#   Step 1: Workflow Triggers: Manual execution via workflow_dispatch.
+#   Step 2: Concurrency & Permissions: Sets write permissions for repository commits.
+#   Step 3: Repository Checkout: Pulls source code via actions/checkout@v4.
+#   Step 4: Python Runtime Setup: Configures Python 3.12 via actions/setup-python@v5.
+#   Step 5: Dependency Installation: Upgrades pip and installs requirements.txt (including pysocks).
+#   Step 6: Execute Extraction Script: Injects Binance, proxy, and Supabase credentials.
+#   Step 7: Commit & Push Ground-Truth CSVs: Commits data/ground_truth/*.csv back to origin/main.
+# ====================================================================================================
+
+name: Extract Binance Ground Truth History
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: binance-data-extraction
+  cancel-in-progress: false
+
+jobs:
+  extract-and-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # Step 3: Repository Checkout
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Step 4: Python Runtime Setup
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Step 5: Install Production Dependencies
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Step 6: Execute Direct API Extraction and Supabase Sync
+      - name: Extract Binance Ground Truth and Overwrite Supabase
+        env:
+          PYTHONUNBUFFERED: "1"
+          BINANCE_PROXY_URL: ${{ secrets.BINANCE_PROXY_URL }}
+          BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
+          BINANCE_TESTNET_API_SECRET: ${{ secrets.BINANCE_TESTNET_API_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python -u src/extract_binance_ground_truth.py
+
+      # Step 7: Commit & Push Extracted CSV Ledgers Back to Repository
+      - name: Commit and Push Ground-Truth CSVs
+        run: |
+          git config --global user.name "GitHub Actions Automation"
+          git config --global user.email "actions@github.com"
+          git add data/ground_truth/*.csv
+          if git diff --staged --quiet; then
+            echo "No new ground-truth CSV changes to commit."
+          else
+            git commit -m "data(ground_truth): sync authentic Binance API trade, order, and income ledgers"
+            git push origin main
+          fi

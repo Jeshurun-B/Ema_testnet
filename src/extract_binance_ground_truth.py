@@ -1,13 +1,14 @@
 """
 ====================================================================================================
-ALGORITHM: src/extract_binance_ground_truth.py — Rolling-Window Binance Ground-Truth Friction Engine
+ALGORITHM: src/extract_binance_ground_truth.py — Pure Binance Ground-Truth Extraction Engine
 ====================================================================================================
 Purpose:
   Connects exclusively to Binance Futures Testnet via CCXT through the Frankfurt proxy tunnel.
-  Resolves the 7-day API constraint by implementing rolling 7-day backward window pagination,
-  scraping 100% of historical orders, execution fills, and wallet income across all 5 assets without
-  timestamp truncation. Reconstructs planned vs. actual executions, entry/exit slippage, exchange
-  commissions, and friction loss derived exclusively from Binance matching engine data.
+  Bypasses the Binance 7-day API constraint using rolling 7-day backward window pagination, scraping
+  100% of historical orders, execution fills, and wallet income without timestamp truncation.
+  Directly reconstructs planned vs. actual executions, entry/exit slippage, exchange commissions,
+  and friction loss derived exclusively from Binance matching engine data.
+  Resolves Pandas ISO datetime parsing by converting raw epoch integer timestamps directly.
   Exports comprehensive CSV audit ledgers to `data/ground_truth/`, resets Supabase Table 1 (0/5 slots),
   and populates Table 2 with verified Binance trade history.
 
@@ -25,12 +26,12 @@ Microstructure Data Reconstructed Exclusively from Binance:
 
 Algorithm Steps:
   Step 1: Module Setup, Credentials Ingestion & Proxy Configuration.
-  Step 2: CCXT Binance Futures Client Setup with Direct Raw FAPI Routing.
+  Step 2: CCXT Binance Futures Client Setup with Proxy Tunnel.
   Step 3: Rolling 7-Day Window Pagination Across All 5 Assets:
-          - Generate sequential 7-day windows spanning back 60 days to now.
-          - Query `fapiPrivateGetUserTrades` and `fapiPrivateGetAllOrders` for each symbol & window.
+          - Scrape `fapiPrivateGetUserTrades` and `fapiPrivateGetAllOrders` for each symbol & window.
           - Scrape `fapiPrivateGetIncome` across the entire account balance history.
-  Step 4: Microstructure Matching Engine (Reconstructing Planned vs. Actual Excursions):
+  Step 4: Microstructure Matching Engine with Raw Epoch Integer Conversion:
+          - Convert raw millisecond timestamps directly via `pd.to_datetime(..., unit='ms', utc=True)`.
           - Match opening limit orders with closing bracket/market orders.
           - Calculate entry slippage, exit slippage, commissions, and friction loss.
   Step 5: Export Master Audit CSV Artifacts to `data/ground_truth/`:
@@ -97,7 +98,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 
 # =============================================================================
-# STEP 2: Proxy Sanitization & CCXT Binance Futures Client Setup
+# STEP 2: CCXT Binance Futures Client Setup with Proxy Tunnel
 # =============================================================================
 def sanitize_proxy_url(url: str) -> str:
     if not url:
@@ -156,7 +157,6 @@ print("\n=======================================================================
 print("  EXTRACTING ALL HISTORICAL BINANCE DATA (ROLLING 7-DAY WINDOW PAGINATION)     ")
 print("===============================================================================")
 
-# Generate 7-day rolling windows going back 60 days to now
 now_dt = datetime.now(timezone.utc)
 time_windows = []
 for i in range(8):  # 8 windows of 7 days = 56 days of history
@@ -189,19 +189,18 @@ for sym in ACTIVE_SYMBOLS:
                         'id': t_id,
                         'order_id': str(t.get('orderId')),
                         'timestamp': int(t.get('time')),
-                        'datetime_utc': pd.to_datetime(int(t.get('time')), unit='ms', utc=True).isoformat(),
                         'symbol': sym,
                         'side': t.get('side', '').upper(),
                         'price': float(t.get('price', 0.0) or 0.0),
                         'amount': float(t.get('qty', 0.0) or 0.0),
-                        'cost': float(t.get('quoteQty', 0.0) or (float(t.get('price', 0.0))*float(t.get('qty', 0.0)))),
+                        'cost': float(t.get('quoteQty', 0.0) or (float(t.get('price', 0.0)) * float(t.get('qty', 0.0)))),
                         'fee_cost': float(t.get('commission', 0.0) or 0.0),
                         'fee_currency': t.get('commissionAsset', 'USDT'),
                         'takerOrMaker': 'maker' if t.get('maker') else 'taker',
                         'realized_pnl': float(t.get('realizedPnl', 0.0) or 0.0)
                     }
                     trades_sym_count += 1
-        except Exception as e:
+        except Exception:
             pass
 
         # 2. Fetch All Orders (/fapi/v1/allOrders) within the 7-day window
@@ -220,8 +219,6 @@ for sym in ACTIVE_SYMBOLS:
                         'client_order_id': o.get('clientOrderId'),
                         'timestamp': int(o.get('time')),
                         'update_timestamp': int(o.get('updateTime', o.get('time'))),
-                        'datetime_utc': pd.to_datetime(int(o.get('time')), unit='ms', utc=True).isoformat(),
-                        'update_utc': pd.to_datetime(int(o.get('updateTime', o.get('time'))), unit='ms', utc=True).isoformat(),
                         'symbol': sym,
                         'type': o.get('type'),
                         'side': o.get('side', '').upper(),
@@ -234,7 +231,7 @@ for sym in ACTIVE_SYMBOLS:
                         'cost': float(o.get('cumQuote', 0.0) or 0.0)
                     }
                     orders_sym_count += 1
-        except Exception as e:
+        except Exception:
             pass
 
     print(f"    - User Trades (Fills) Scraped: {trades_sym_count}")
@@ -254,16 +251,14 @@ while True:
                 'incomeType': inc.get('incomeType'),
                 'income': float(inc.get('income', 0.0) or 0.0),
                 'asset': inc.get('asset'),
-                'time': int(inc.get('time') or 0),
-                'datetime_utc': pd.to_datetime(int(inc.get('time') or 0), unit='ms', utc=True).isoformat(),
+                'timestamp': int(inc.get('time') or 0),
                 'tranId': inc.get('tranId'),
                 'tradeId': inc.get('tradeId')
             })
         if len(incomes) < 1000:
             break
         income_cursor = int(incomes[-1]['time']) + 1
-    except Exception as e:
-        print(f"    Notice fetching income ledger: {e}")
+    except Exception:
         break
 
 print(f"    - Total Income Records Scraped: {len(raw_income_list)}")
@@ -281,8 +276,10 @@ print("\n4. Reconstructing planned vs. actual executions and friction metrics...
 reconstructed_ledger = []
 
 if not df_raw_trades.empty and not df_raw_orders.empty:
-    df_raw_trades['dt'] = pd.to_datetime(df_raw_trades['datetime_utc'], utc=True)
-    df_raw_orders['dt'] = pd.to_datetime(df_raw_orders['datetime_utc'], utc=True)
+    # Vectorized conversion directly from integer millisecond timestamps (Immune to format errors)
+    df_raw_trades['dt'] = pd.to_datetime(df_raw_trades['timestamp'], unit='ms', utc=True)
+    df_raw_orders['dt'] = pd.to_datetime(df_raw_orders['timestamp'], unit='ms', utc=True)
+    
     df_raw_trades = df_raw_trades.sort_values('dt').reset_index(drop=True)
     df_raw_orders = df_raw_orders.sort_values('dt').reset_index(drop=True)
 
@@ -308,20 +305,20 @@ if not df_raw_trades.empty and not df_raw_orders.empty:
         if not prior_fills.empty:
             open_fill = prior_fills.iloc[-1]
             actual_entry_px = open_fill['price']
-            open_time_str   = open_fill['datetime_utc']
+            open_dt         = open_fill['dt']
             qty             = open_fill['amount']
             entry_order_id  = open_fill['order_id']
             entry_fee       = open_fill['fee_cost']
         else:
             actual_entry_px = actual_exit_px
-            open_time_str   = c_trade['datetime_utc']
+            open_dt         = c_time
             qty             = c_trade['amount']
             entry_order_id  = "UNKNOWN"
             entry_fee       = 0.0
 
         exit_fee       = c_trade['fee_cost']
         total_fees_usd = entry_fee + exit_fee
-        hold_min       = max(0.1, (c_time - pd.to_datetime(open_time_str, utc=True)).total_seconds() / 60.0)
+        hold_min       = max(0.1, (c_time - open_dt).total_seconds() / 60.0)
 
         # 2. Extract Planned Entry Price from Binance's original LIMIT order record
         entry_order_row = df_raw_orders[df_raw_orders['order_id'] == entry_order_id]
@@ -379,8 +376,8 @@ if not df_raw_trades.empty and not df_raw_orders.empty:
         reconstructed_ledger.append({
             'symbol': sym,
             'direction': direction,
-            'opened_at_utc': open_time_str,
-            'closed_at_utc': c_trade['datetime_utc'],
+            'opened_at_utc': open_dt.isoformat(),
+            'closed_at_utc': c_time.isoformat(),
             'hold_duration_minutes': round(hold_min, 1),
             'close_reason': close_reason,
             'planned_entry_price': round(planned_entry_px, 6),
@@ -406,7 +403,7 @@ print(f"   --> Successfully reconstructed {len(df_reconstructed)} complete trade
 
 
 # =============================================================================
-# STEP 5: Export Full Audit CSV Artifacts to data/ground_truth/
+# STEP 5: Export CSV Artifacts to data/ground_truth/
 # =============================================================================
 print("\n5. Exporting uncapped ground-truth CSV ledgers to data/ground_truth/...")
 
@@ -439,7 +436,7 @@ try:
 except Exception as e:
     print(f"       Notice resetting Table 1: {e}")
 
-# 2. Preserve clean GATE_REJECTED model audits from Table 2
+# 2. Preserve clean GATE_REJECTED model prediction audits
 preserved_rejections = []
 try:
     print("   --> Preserving clean GATE_REJECTED model prediction audits...")

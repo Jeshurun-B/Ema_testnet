@@ -1,35 +1,35 @@
 r"""
 ====================================================================================================
-ALGORITHM: main.py — Tier-1 Production Daemon with Precise Order-ID Exit Reconciliation
+ALGORITHM: main.py — Streamlined Production Daemon with 100% Crossover Raw Telemetry
 ====================================================================================================
 Purpose:
   Institutional 5.5-hour continuous trading engine. Operates with In-Memory State as the primary
   source of truth during runtime (Hot Path) with Supabase serving purely as an asynchronous write-only
-  telemetry sink (Cold Path). Resolves stale historical trade calculations by checking the exact
-  status of `binance_tp_id` and `binance_sl_id` orders. Restores the Idempotent Timestamp Guard,
-  enforces strict directional inversions (`signal != pos_dir`), phase-locks sleep timing to :05.00,
-  and uses GH_PAT to dispatch runners.yml.
+  telemetry sink (Cold Path). Logs raw data for 100% of crossovers (both passed and rejected) to Table 2,
+  routes orders strictly for passed trades, enforces the Dynamic Soft-Gate and 15m ATR Noise-Floor Clamp,
+  applies strict directional inversions, and dispatches runners.yml via GH_PAT at minute 320.
 
 Algorithm Steps:
   Step 1: Module Setup, Dynamic Price Formatter & Output Unbuffering.
   Step 2: Engine Initialization & One-Time Startup Hydration (active_by_symbol).
   Step 3: Self-Chaining Dispatcher (Targeting runners.yml via GH_PAT).
-  Step 4: Silent In-Memory Position Maintenance with Order-ID Reconciliation:
-          - For PENDING_LIMIT: polls `fetch_order(binance_order_id)` -> on fill, deploys brackets.
-            Enforces 15m wall-clock timeout -> physically cancels order on Binance.
-          - For FILLED: inspects `binance_tp_id` and `binance_sl_id` specifically.
-            Extracts the exact closing fill price and commissions of THAT specific order.
-            Eliminates all stale historical trade calculations.
-  Step 5: 15-Minute Pipeline (Idempotent Bar Guard & Strict Directional Inversion):
-          - Rejects duplicate bars via `last_evaluated_candles`.
+  Step 4: Silent In-Memory Position Maintenance with Real Exchange Order ID (Every 10s).
+  Step 5: 15-Minute Pipeline (100% Raw Crossover Telemetry & Strict Inversions):
+          - Ingests closed bars across 15m, 4h, 1d.
+          - Rejects duplicate completed bars via `last_evaluated_candles`.
           - Detects 9/15 EMA crossover on completed candle [-1] vs [-2].
           - Liquidates position IF AND ONLY IF `signal != pos_dir`.
-          - Computes 25 features, runs RAM inference, evaluates R:R >= 2.0 hurdle,
-            and routes quantized limit entry capturing `(trade_id, binance_order_id)`.
-  Step 6: Master Phase-Locked Loop (Target: Exact :05.00 Close).
+          - Computes 25 features, extracts 15m ATR %, and runs RAM model inference.
+          - Evaluates gates (Dynamic Soft-Gate + 15m ATR Clamp).
+          - Emits raw telemetry record to Supabase Table 2 for 100% of crossovers.
+          - Routes limit entry order to Binance ONLY if passed.
+  Step 6: Master Phase-Locked Execution Loop (Target: Exact :05.00 Close).
 ====================================================================================================
 """
 
+# =============================================================================
+# STEP 1: Module Setup, Price Formatter & Force Unbuffered Output
+# =============================================================================
 import os
 import sys
 import time
@@ -84,7 +84,7 @@ def format_price(price: float) -> str:
 # STEP 2: Engine Initialization & One-Time Startup Hydration
 # =============================================================================
 print("===============================================================================")
-print("  EMA_TESTNET PRODUCTION DAEMON (TIER-1 IN-MEMORY HOT-PATH ENGINE)             ")
+print("  EMA_TESTNET PRODUCTION DAEMON (DYNAMIC SOFT-GATE & RAW TELEMETRY SINK)       ")
 print(f"  Max Lifespan     : {MAX_RUN_DURATION_MINUTES} Minutes ({MAX_RUN_DURATION_MINUTES/60:.2f} Hours)")
 print(f"  Heartbeat Tick   : Every {HEARTBEAT_INTERVAL_SEC} Seconds (Silent In-Memory Mode)           ")
 print(f"  Target Repository: {GITHUB_REPOSITORY}                                       ")
@@ -248,7 +248,6 @@ def run_position_maintenance():
                 close_reason = None
                 fees_paid = 0.0
 
-                # Check TP Order specifically
                 if tp_id and "MOCK" not in str(tp_id):
                     try:
                         tp_info = execution.exchange.fetch_order(tp_id, sym)
@@ -259,7 +258,6 @@ def run_position_maintenance():
                     except Exception:
                         pass
 
-                # Check SL Order specifically
                 if not close_reason and sl_id and "MOCK" not in str(sl_id):
                     try:
                         sl_info = execution.exchange.fetch_order(sl_id, sym)
@@ -270,7 +268,6 @@ def run_position_maintenance():
                     except Exception:
                         pass
 
-                # Fallback if position was closed on reversal
                 if not close_reason:
                     exit_price = float(trade.get("dynamic_sl_price", entry_fill))
                     close_reason = "SL_HIT"
@@ -304,7 +301,7 @@ def run_position_maintenance():
 
 
 # =============================================================================
-# STEP 5: 15-Minute Pipeline (Idempotent Guard & Strict Directional Inversion)
+# STEP 5: 15-Minute Pipeline (100% Crossover Telemetry & Thin Live Routing)
 # =============================================================================
 def run_candle_close_pipeline():
     global active_by_symbol, last_evaluated_candles
@@ -331,8 +328,7 @@ def run_candle_close_pipeline():
             if not signal:
                 continue
 
-            # ── IDEMPOTENT DEDUPLICATION GUARD ──
-            # Rejects duplicate evaluations of the exact same completed candle
+            # ── IDEMPOTENT BAR DEDUPLICATION GUARD ──
             if last_evaluated_candles.get(symbol) == candle_close_utc:
                 continue
 
@@ -351,7 +347,6 @@ def run_candle_close_pipeline():
                     pos_dir = live_binance_positions[symbol]["side"].upper()
 
                 # ── STRICT DIRECTIONAL INVERSION CHECK ──
-                # Liquidate IF AND ONLY IF signal opposes active position (signal != pos_dir)
                 if signal != pos_dir:
                     print(f"\n[Crossover Inversion Detected] {signal} crossover opposing active {pos_dir}! Liquidating immediately...")
 
@@ -373,12 +368,11 @@ def run_candle_close_pipeline():
                         del active_by_symbol[symbol]
                     free_cash = execution.get_free_usdt_balance()
                 else:
-                    # Same direction signal on active trade -> Ignore duplicate entry
                     continue
 
             print(f"\n[Crossover Fired] {symbol} -> {signal} at {format_price(cross_price)} (Candle Close: {candle_close_utc})")
 
-            # Extract 25 master indicators & compute dual-engine model predictions
+            # Extract 25 master indicators (including 15m ATR % for noise clamp)
             features_25 = compute_production_features(df_15m, df_4h, df_1d)
             recent_history = [features_25] * 30
             model_outputs  = model_registry.predict_trade_setup(symbol, signal, features_25, recent_history)
@@ -386,20 +380,24 @@ def run_candle_close_pipeline():
             print(f"   --> Predictions: Profit MFE={model_outputs['pred_profit_mfe']:.2f}% | Danger MAE={model_outputs['pred_danger_mae']:.2f}%")
             print(f"   --> Gates      : Prob(Profit)={model_outputs['prob_profit']:.3f} | Prob(Danger)={model_outputs['prob_danger']:.3f}")
 
+            # Evaluate Gates with Dynamic Soft-Gate and ATR % Noise Clamp
             manifest = gates_engine.evaluate_gates_and_sizing(
                 symbol=symbol,
                 direction=signal,
                 entry_price=cross_price,
                 model_outputs=model_outputs,
+                atr_pct=features_25.get('atr_pct', 0.40),
                 free_wallet_balance=free_cash,
                 active_positions_count=len(active_by_symbol)
             )
 
+            # ── IMMUTABLE TELEMETRY EMISSION (LOGS 100% OF CROSSOVERS) ──
             if manifest["approved"]:
                 print(f"   --> APPROVED! [Category: {manifest['gate_combo_tag']} | R:R: {manifest['rr_ratio']}:1]")
                 print(f"       Allocated Cash: ${manifest['allocated_cash']:,.2f} | Quantity: {manifest['contract_quantity']} {symbol}")
                 print(f"       Dynamic TP: {format_price(manifest['dynamic_tp_price'])} | Dynamic SL: {format_price(manifest['dynamic_sl_price'])}")
 
+                # Place order on Binance & write to Table 1
                 trade_id, binance_order_id = execution.execute_limit_entry(manifest, candle_close_utc)
                 print(f"       Order Dispatched! Trade UUID: {trade_id} | Binance ID: {binance_order_id}")
 
@@ -422,6 +420,7 @@ def run_candle_close_pipeline():
                 }
                 free_cash = execution.get_free_usdt_balance()
             else:
+                # FAILED SETUP: Log raw prediction audit to Supabase Table 2, do NOT touch Binance
                 print(f"   --> REJECTED: {manifest['rejection_reason']} (R:R = {manifest['rr_ratio']})")
                 telemetry.record_rejected_signal(symbol, signal, cross_price, manifest)
                 print(f"       Rejection telemetry logged to Supabase Table 2 (testnet_trade_log).")

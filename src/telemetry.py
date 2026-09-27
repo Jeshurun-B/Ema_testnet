@@ -80,6 +80,16 @@ class TelemetryEngine:
             print(f"[State Hydration Warning] Could not hydrate state from Supabase ({e}). Starting with empty cache.")
             return {}
 
+    def get_active_trades(self) -> list:
+        """Returns empty list if DB offline or returns active trades."""
+        try:
+            def op():
+                return self.db.table(self.active_table).select("*").in_("order_status", ["PENDING_LIMIT", "FILLED"]).execute()
+            res = self._execute_with_retry(op, max_retries=2, initial_delay=1.0)
+            return res.data if res.data else []
+        except Exception:
+            return []
+
     def record_new_order(
         self,
         symbol: str,

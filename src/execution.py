@@ -1,13 +1,13 @@
 """
 ====================================================================================================
-ALGORITHM: src/execution.py — Institutional Order Routing Engine with Mark Price & Dual-ID Return
+ALGORITHM: src/execution.py — Production Order Routing & Mark Price Execution Gateway
 ====================================================================================================
 Purpose:
-  Institutional exchange connector to Binance Futures Testnet via CCXT. Explicitly sets native
-  brackets to `workingType: 'MARK_PRICE'` to eliminate local order-book liquidity sweeps. Returns
-  both `(trade_id, binance_order_id)` on limit entries to allow precise order tracking. Normalizes
-  symbols (stripping ':USDT'), measures wall-clock timeouts via `created_at`, suppresses benign
-  margin mode notices (code -4067), and annihilates ghost brackets on signal flips.
+  Institutional exchange connector to Binance Futures Testnet via CCXT through the Frankfurt proxy.
+  Enforces `workingType: 'MARK_PRICE'` on all native TP and SL orders to eliminate order-book air pockets.
+  Captures and returns both `(trade_id, binance_order_id)`, normalizes symbols (stripping ':USDT'),
+  measures wall-clock timeouts via `created_at`, suppresses benign margin mode notices (code -4067),
+  and annihilates ghost brackets on signal flips.
 
 Algorithm Steps:
   Step 1: Module Setup, Safe Math & Dependency Ingestion (including pandas as pd).
@@ -65,6 +65,9 @@ else:
     API_KEY    = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
     API_SECRET = os.environ.get("BINANCE_TESTNET_API_SECRET", "").strip()
     PROXY_URL  = os.environ.get("BINANCE_PROXY_URL", "").strip()
+
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("[FATAL] Binance API credentials missing from environment!")
 
 
 # =============================================================================
@@ -160,16 +163,19 @@ class ExecutionEngine:
     def get_free_usdt_balance(self) -> float:
         """Queries Binance Futures wallet for available free USDT cash balance."""
         if not self.api_key or not self.api_secret:
-            return 10000.0
+            return 5000.0
         try:
             balance = self.exchange.fetch_balance()
-            return float(balance.get('USDT', {}).get('free', 10000.0))
+            return float(balance.get('USDT', {}).get('free', 5000.0))
         except Exception as e:
-            print(f"[Execution Warning] Failed to fetch live balance ({e}). Defaulting to $10,000.")
-            return 10000.0
+            print(f"[Execution Warning] Failed to fetch live balance ({e}). Defaulting to $5,000.")
+            return 5000.0
 
     def get_active_positions(self) -> dict:
-        """Fetches all open positions on Binance Futures with non-zero contracts."""
+        """
+        Fetches all open positions on Binance Futures with non-zero contracts.
+        NORMALIZATION ENFORCEMENT: Strips '/USDT:USDT' and ':USDT' so keys match 'BTCUSDT'.
+        """
         if not self.api_key or not self.api_secret:
             return {}
         try:
@@ -224,7 +230,6 @@ class ExecutionEngine:
             self.exchange.set_margin_mode('ISOLATED', symbol)
         except Exception as e:
             err_msg = str(e).lower()
-            # Silently catch benign notices: already isolated, no need to change, or open orders exist (-4067)
             if "-4067" not in err_msg and "no need to change" not in err_msg and "already" not in err_msg:
                 print(f"[Execution Notice] Margin mode setting for {symbol}: {e}")
 
@@ -239,7 +244,7 @@ class ExecutionEngine:
     # STEP 7: Limit Entry Order Placement (Returns trade_id, binance_order_id)
     # =========================================================================
     def execute_limit_entry(self, manifest: dict, candle_close_utc: str):
-        """Places quantized limit entry and returns tuple (trade_id, binance_order_id)."""
+        """Places quantized limit entry on Binance and returns tuple (trade_id, binance_order_id)."""
         symbol         = manifest["symbol"]
         direction      = manifest["direction"].upper()
         entry_price    = manifest["entry_price"]

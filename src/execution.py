@@ -1,38 +1,29 @@
 """
 ====================================================================================================
-ALGORITHM: src/execution.py — Production Order Routing & Mark Price Execution Gateway
+ALGORITHM: src/execution.py — Production Market Order Routing & Mark Price Execution Gateway
 ====================================================================================================
 Purpose:
   Institutional exchange connector to Binance Futures Testnet via CCXT through the Frankfurt proxy.
-  Enforces `workingType: 'MARK_PRICE'` on all native TP and SL orders to eliminate order-book air pockets.
-  Captures and returns both `(trade_id, binance_order_id)`, normalizes symbols (stripping ':USDT'),
-  measures wall-clock timeouts via `created_at`, suppresses benign margin mode notices (code -4067),
-  and annihilates ghost brackets on signal flips.
+  Switches entry execution to immediate Market (Taker) orders, guaranteeing 100% deterministic fills
+  and eliminating 15-minute limit timeouts and ghost limit orders on the book. Enforces `MARK_PRICE`
+  brackets, sweeps ghost orders on boot, normalizes symbols, and manages signal flips.
 
 Algorithm Steps:
   Step 1: Module Setup, Safe Math & Dependency Ingestion (including pandas as pd).
   Step 2: Proxy URI Sanitization Utility.
-  Step 3: CCXT Client Initialization & Pre-Flight Handshake (enable_demo_trading).
-  Step 4: Account Capital & Normalized Position Discovery (get_active_positions).
-  Step 5: Precision Quantization & minNotional Compliance (5.0 USDT floor).
-  Step 6: Isolated Margin & 1.0x Leverage Configuration (Suppresses code -4067).
-  Step 7: Limit Entry Order Dispatch:
-          - Places quantized limit entry on Binance.
-          - Records trade in Supabase Table 1 as 'PENDING_LIMIT'.
-          - Returns tuple: `(trade_id, binance_order_id)`.
-  Step 8: Native Bracket Deployment with Mark Price Protection:
-          - Submits TAKE_PROFIT_MARKET and STOP_MARKET with `workingType: 'MARK_PRICE'`.
-  Step 9: Wall-Clock Order Timeout Handler:
-          - Cancels unfilled limit orders older than 15 wall-clock minutes.
-  Step 10: Signal-Flip Liquidation with Ghost Bracket Annihilation:
-          - Cancels all resting orders on symbol before market close (reduceOnly=True).
-  Step 11: Integration Self-Test Probe (`if __name__ == '__main__'`).
+  Step 3: CCXT Client Initialization & Pre-Flight Handshake.
+  Step 4: Account Capital & Normalized Position Discovery.
+  Step 5: The Order Book Sweeper (Purges all unlinked orders across active assets on boot).
+  Step 6: Precision Quantization & minNotional Compliance.
+  Step 7: Immediate Market Entry Order Dispatch:
+          - Places immediate market order on Binance.
+          - Deploys native resting brackets pegged strictly to `workingType: MARK_PRICE`.
+          - Records active trade in Supabase Table 1 as 'FILLED'.
+          - Returns tuple: `(trade_id, binance_order_id, actual_fill_price)`.
+  Step 8: Signal-Flip Reversal Liquidation (Ghost Bracket Annihilation + Market Close).
 ====================================================================================================
 """
 
-# =============================================================================
-# STEP 1: Module Setup, Dependency Resolution & Environment Ingestion
-# =============================================================================
 import os
 import time
 import json
@@ -70,11 +61,7 @@ if not API_KEY or not API_SECRET:
     raise RuntimeError("[FATAL] Binance API credentials missing from environment!")
 
 
-# =============================================================================
-# STEP 2: Proxy URI Sanitization Utility
-# =============================================================================
 def sanitize_proxy_url(url: str) -> str:
-    """Normalizes forward proxy URLs to prevent OpenSSL version mismatch crashes."""
     if not url:
         return ""
     clean = url.strip()
@@ -85,9 +72,6 @@ def sanitize_proxy_url(url: str) -> str:
     return clean
 
 
-# =============================================================================
-# STEP 3: CCXT Client Initialization & Pre-Flight Handshake
-# =============================================================================
 class ExecutionEngine:
     def __init__(
         self,
@@ -112,14 +96,9 @@ class ExecutionEngine:
         }
 
         if self.proxy_url:
-            exchange_config['proxies'] = {
-                'http': self.proxy_url,
-                'https': self.proxy_url
-            }
-            masked_proxy = self.proxy_url.split('@')[-1] if '@' in self.proxy_url else self.proxy_url
-            print(f"[Network] CCXT configured with proxy tunnel -> {masked_proxy}")
-        else:
-            print(f"[Network Notice] Direct network connection active.")
+            exchange_config['proxies'] = {'http': self.proxy_url, 'https': self.proxy_url}
+            masked = self.proxy_url.split('@')[-1] if '@' in self.proxy_url else self.proxy_url
+            print(f"[Network] CCXT configured with proxy tunnel -> {masked}")
 
         self.exchange = ccxt.binanceusdm(exchange_config)
 
@@ -133,49 +112,40 @@ class ExecutionEngine:
             self.exchange.urls['api']['fapiPrivateV2'] = 'https://testnet.binancefuture.com/fapi/v2'
 
         self.markets_loaded = False
-        self._preflight_diagnostic_probe()
         self._load_markets_safe()
 
-    def _preflight_diagnostic_probe(self):
-        """Runs pre-flight egress diagnostic to verify IP and country."""
-        try:
-            proxies_dict = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
-            res = requests.get('https://ipinfo.io/json', proxies=proxies_dict, timeout=8).json()
-            ip = res.get('ip', 'Unknown')
-            country = res.get('country', 'Unknown')
-            city = res.get('city', 'Unknown')
-            print(f"[Network Diagnostic] Egress IP: {ip} | Country: {country} ({city})")
-        except Exception as e:
-            print(f"[Network Diagnostic Notice] Diagnostic skipped: {e}")
-
     def _load_markets_safe(self):
-        """Safely loads precision rules and market filters."""
         try:
             self.exchange.load_markets()
             self.markets_loaded = True
-            print(f"[Network Success] Binance Testnet markets loaded successfully.")
+            print("[Network Success] Binance Testnet markets loaded successfully.")
         except Exception as e:
             print(f"[Execution Warning] Could not load market filters: {repr(e)}")
 
-    # =========================================================================
-    # STEP 4: Capital & Normalized Position Discovery
-    # =========================================================================
+    def purge_unlinked_ghost_orders(self, active_symbols: list):
+        """Sweeps and purges all open orders on Binance on startup to eliminate ghost orders."""
+        print("[Sweeper Probe] Checking for resting ghost orders on Binance matching engine...")
+        for sym in active_symbols:
+            try:
+                open_orders = self.exchange.fetch_open_orders(sym)
+                if open_orders:
+                    print(f"   --> Found {len(open_orders)} open order(s) for {sym}. Purging all...")
+                    self.exchange.cancel_all_orders(sym)
+                    print(f"       [PURGED] Successfully purged open orders for {sym}.")
+            except Exception as e:
+                print(f"   --> Notice sweeping {sym}: {e}")
+
     def get_free_usdt_balance(self) -> float:
-        """Queries Binance Futures wallet for available free USDT cash balance."""
         if not self.api_key or not self.api_secret:
             return 5000.0
         try:
             balance = self.exchange.fetch_balance()
             return float(balance.get('USDT', {}).get('free', 5000.0))
         except Exception as e:
-            print(f"[Execution Warning] Failed to fetch live balance ({e}). Defaulting to $5,000.")
+            print(f"[Execution Warning] Balance check fallback: {e}")
             return 5000.0
 
     def get_active_positions(self) -> dict:
-        """
-        Fetches all open positions on Binance Futures with non-zero contracts.
-        NORMALIZATION ENFORCEMENT: Strips '/USDT:USDT' and ':USDT' so keys match 'BTCUSDT'.
-        """
         if not self.api_key or not self.api_secret:
             return {}
         try:
@@ -184,11 +154,8 @@ class ExecutionEngine:
             for pos in positions:
                 contracts = float(pos.get('contracts', 0.0))
                 if contracts > 0:
-                    raw_sym = pos.get('info', {}).get('symbol')
-                    if not raw_sym:
-                        raw_sym = pos['symbol'].split(':')[0].replace('/', '')
+                    raw_sym = pos.get('info', {}).get('symbol') or pos['symbol'].split(':')[0].replace('/', '')
                     sym = raw_sym.strip()
-                    
                     active_map[sym] = {
                         'contracts': contracts,
                         'side': pos.get('side', '').lower(),
@@ -197,14 +164,10 @@ class ExecutionEngine:
                     }
             return active_map
         except Exception as e:
-            print(f"[Execution Warning] Failed to fetch positions: {repr(e)}")
+            print(f"[Execution Warning] Positions check fallback: {e}")
             return {}
 
-    # =========================================================================
-    # STEP 5: Precision Quantization & minNotional Compliance
-    # =========================================================================
     def quantize_order_params(self, symbol: str, price: float, quantity: float):
-        """Quantizes price to tickSize and amount to stepSize; enforces 5.0 USDT floor."""
         if not self.markets_loaded:
             self._load_markets_safe()
 
@@ -218,11 +181,7 @@ class ExecutionEngine:
 
         return clean_price, clean_qty
 
-    # =========================================================================
-    # STEP 6: Isolated Margin & 1.0x Leverage Setup (Suppresses Error -4067)
-    # =========================================================================
     def setup_symbol_isolated_1x(self, symbol: str):
-        """Configures asset to ISOLATED margin mode and 1.0x leverage silently."""
         if not self.api_key or not self.api_secret:
             return
 
@@ -231,174 +190,96 @@ class ExecutionEngine:
         except Exception as e:
             err_msg = str(e).lower()
             if "-4067" not in err_msg and "no need to change" not in err_msg and "already" not in err_msg:
-                print(f"[Execution Notice] Margin mode setting for {symbol}: {e}")
+                print(f"[Execution Notice] Margin mode for {symbol}: {e}")
 
         try:
             self.exchange.set_leverage(1, symbol)
         except Exception as e:
             err_msg = str(e).lower()
             if "not modified" not in err_msg:
-                print(f"[Execution Notice] Leverage setting for {symbol}: {e}")
+                print(f"[Execution Notice] Leverage for {symbol}: {e}")
 
-    # =========================================================================
-    # STEP 7: Limit Entry Order Placement (Returns trade_id, binance_order_id)
-    # =========================================================================
-    def execute_limit_entry(self, manifest: dict, candle_close_utc: str):
-        """Places quantized limit entry on Binance and returns tuple (trade_id, binance_order_id)."""
+    def execute_market_entry(self, manifest: dict, candle_close_utc: str):
+        """
+        Executes immediate Market (Taker) entry on Binance. Fills instantly,
+        deploys native MARK_PRICE resting brackets, and records in Supabase Table 1 as FILLED.
+        """
         symbol         = manifest["symbol"]
         direction      = manifest["direction"].upper()
         entry_price    = manifest["entry_price"]
         raw_qty        = manifest["contract_quantity"]
         allocated_cash = manifest["allocated_cash"]
+        trade_tier     = manifest["trade_tier"]
 
         self.setup_symbol_isolated_1x(symbol)
         clean_price, clean_qty = self.quantize_order_params(symbol, entry_price, raw_qty)
         order_side = 'buy' if direction == 'LONG' else 'sell'
+        close_side = 'sell' if direction == 'LONG' else 'buy'
 
         binance_order_id = None
+        actual_fill_px   = clean_price
+
+        # 1. Dispatch Immediate Market Order (Taker)
         if self.api_key and self.api_secret:
             try:
                 order_res = self.exchange.create_order(
                     symbol=symbol,
-                    type='limit',
+                    type='market',
                     side=order_side,
-                    amount=clean_qty,
-                    price=clean_price,
-                    params={'timeInForce': 'GTC'}
+                    amount=clean_qty
                 )
                 binance_order_id = str(order_res['id'])
-                print(f"[Binance Execution] Limit Entry Placed: {direction} {clean_qty} {symbol} @ ${clean_price} (ID: {binance_order_id})")
+                actual_fill_px = float(order_res.get('average') or order_res.get('price') or clean_price)
+                print(f"[Binance Execution] {trade_tier} Market Entry Filled: {direction} {clean_qty} {symbol} @ ${actual_fill_px} (ID: {binance_order_id})")
             except Exception as e:
-                raise RuntimeError(f"[Execution Error] Limit order rejected by Binance: {repr(e)}")
+                raise RuntimeError(f"[Execution Error] Market order rejected by Binance: {repr(e)}")
         else:
-            binance_order_id = f"MOCK_ENTRY_{int(time.time())}"
-            print(f"[Mock Execution] Limit Entry Recorded: {direction} {clean_qty} {symbol} @ ${clean_price}")
+            binance_order_id = f"MOCK_{int(time.time())}"
+            print(f"[Mock Execution] {trade_tier} Market Entry: {direction} {clean_qty} {symbol} @ ${clean_price}")
 
-        trade_id = self.telemetry.record_new_order(
-            symbol=symbol,
-            direction=direction,
-            candle_close_utc=candle_close_utc,
-            signal_price=entry_price,
-            limit_entry_price=clean_price,
-            allocated_cash=allocated_cash,
-            contract_quantity=clean_qty,
-            dynamic_tp_price=manifest["dynamic_tp_price"],
-            dynamic_sl_price=manifest["dynamic_sl_price"],
-            idealized_tp_pct=manifest["dynamic_tp_pct"],
-            idealized_sl_pct=manifest["dynamic_sl_pct"],
-            category_tag=manifest["gate_combo_tag"],
-            risk_budget_usd=manifest["risk_budget_usd"],
-            binance_order_id=binance_order_id
-        )
+        # 2. Deploy Native MARK_PRICE Brackets Immediately
+        tp_id, sl_id = None, None
+        if self.api_key and self.api_secret:
+            try:
+                tp_px = float(manifest["dynamic_tp_price"])
+                sl_px = float(manifest["dynamic_sl_price"])
+                clean_tp, _ = self.quantize_order_params(symbol, tp_px, clean_qty)
+                clean_sl, _ = self.quantize_order_params(symbol, sl_px, clean_qty)
 
-        return trade_id, binance_order_id
-
-    # =========================================================================
-    # STEP 8: Native Bracket Deployment with Mark Price Protection
-    # =========================================================================
-    def check_and_deploy_brackets(self, trade_record: dict):
-        """Deploys resting brackets pegged strictly to workingType: 'MARK_PRICE'."""
-        trade_id   = trade_record["id"]
-        symbol     = trade_record["symbol"]
-        direction  = trade_record["direction"].upper()
-        binance_id = trade_record.get("binance_order_id")
-        qty        = float(trade_record["contract_quantity"])
-
-        if not self.api_key or not self.api_secret or not binance_id or "MOCK" in str(binance_id):
-            return
-
-        try:
-            order_info = self.exchange.fetch_order(binance_id, symbol)
-            status = order_info.get('status', '').lower()
-
-            if status == 'closed':
-                actual_fill = float(order_info.get('average') or order_info.get('price') or trade_record["limit_entry_price"])
-                print(f"[Order Fill Detected] {symbol} {direction} filled at ${actual_fill}. Deploying resting brackets (MARK_PRICE protected)...")
-                
-                self.telemetry.record_order_fill(trade_id, actual_fill)
-
-                tp_price = float(trade_record["dynamic_tp_price"])
-                sl_price = float(trade_record["dynamic_sl_price"])
-                clean_tp_price, _ = self.quantize_order_params(symbol, tp_price, qty)
-                clean_sl_price, _ = self.quantize_order_params(symbol, sl_price, qty)
-
-                close_side = 'sell' if direction == 'LONG' else 'buy'
-
-                # Native TAKE_PROFIT_MARKET pegged strictly to MARK_PRICE
                 tp_order = self.exchange.create_order(
-                    symbol=symbol,
-                    type='TAKE_PROFIT_MARKET',
-                    side=close_side,
-                    amount=qty,
-                    params={
-                        'stopPrice': clean_tp_price,
-                        'reduceOnly': True,
-                        'workingType': 'MARK_PRICE'
-                    }
+                    symbol=symbol, type='TAKE_PROFIT_MARKET', side=close_side, amount=clean_qty,
+                    params={'stopPrice': clean_tp, 'reduceOnly': True, 'workingType': 'MARK_PRICE'}
                 )
-
-                # Native STOP_MARKET pegged strictly to MARK_PRICE
                 sl_order = self.exchange.create_order(
-                    symbol=symbol,
-                    type='STOP_MARKET',
-                    side=close_side,
-                    amount=qty,
-                    params={
-                        'stopPrice': clean_sl_price,
-                        'reduceOnly': True,
-                        'workingType': 'MARK_PRICE'
-                    }
+                    symbol=symbol, type='STOP_MARKET', side=close_side, amount=clean_qty,
+                    params={'stopPrice': clean_sl, 'reduceOnly': True, 'workingType': 'MARK_PRICE'}
                 )
+                tp_id = str(tp_order['id'])
+                sl_id = str(sl_order['id'])
+                print(f"   --> Native Brackets Deployed: TP @ ${clean_tp} | SL @ ${clean_sl} [MARK_PRICE]")
+            except Exception as e:
+                print(f"[Execution Warning] Bracket placement notice: {e}")
 
-                self.telemetry.record_bracket_order_ids(trade_id, str(tp_order['id']), str(sl_order['id']))
-                print(f"   --> Native Brackets Deployed: TP @ ${clean_tp_price} | SL @ ${clean_sl_price} [workingType: MARK_PRICE]")
+        # 3. Record Active Trade in Supabase Table 1 as FILLED
+        trade_id = self.telemetry.record_active_trade({
+            "symbol": symbol,
+            "direction": direction,
+            "trade_tier": trade_tier,
+            "entry_price": actual_fill_px,
+            "contract_quantity": clean_qty,
+            "allocated_cash": allocated_cash,
+            "dynamic_tp_price": manifest["dynamic_tp_price"],
+            "dynamic_sl_price": manifest["dynamic_sl_price"],
+            "binance_order_id": binance_order_id,
+            "binance_tp_id": tp_id,
+            "binance_sl_id": sl_id,
+            "order_status": "FILLED"
+        })
 
-        except Exception as e:
-            print(f"[Execution Error] Failed to deploy brackets for {symbol}: {repr(e)}")
+        return trade_id, binance_order_id, tp_id, sl_id, actual_fill_px
 
-    # =========================================================================
-    # STEP 9: Wall-Clock Order Timeout Cancellation
-    # =========================================================================
-    def handle_expired_limit_orders(self, max_timeout_minutes: int = 15):
-        """Cancels limit orders older than 15.0 wall-clock minutes."""
-        active_orders = self.telemetry.get_active_trades()
-        now_dt = datetime.now(timezone.utc)
-
-        for trade in active_orders:
-            if trade.get("order_status") != "PENDING_LIMIT":
-                continue
-
-            created_str = trade.get("created_at")
-            if created_str:
-                order_dt = pd.to_datetime(created_str, utc=True)
-            else:
-                candle_close_str = trade.get("candle_close_utc")
-                order_dt = pd.to_datetime(candle_close_str, utc=True) if candle_close_str else now_dt
-
-            elapsed_min = (now_dt - order_dt).total_seconds() / 60.0
-
-            if elapsed_min >= max_timeout_minutes:
-                symbol = trade["symbol"]
-                binance_id = trade.get("binance_order_id")
-
-                print(f"[Timeout Triggered] {symbol} limit entry unfilled after {elapsed_min:.1f}m wall-clock time. Cancelling...")
-                if self.api_key and self.api_secret and binance_id and "MOCK" not in str(binance_id):
-                    try:
-                        self.exchange.cancel_order(binance_id, symbol)
-                        print(f"   --> Order {binance_id} cancelled successfully on Binance.")
-                    except Exception as e:
-                        print(f"   --> Cancel Notice: {e}")
-
-                self.telemetry.record_missed_trade(
-                    trade_id=trade["id"],
-                    notes=f"Limit entry expired unfilled after {elapsed_min:.1f} wall-clock minutes"
-                )
-
-    # =========================================================================
-    # STEP 10: Signal-Flip Liquidation with Ghost Bracket Annihilation
-    # =========================================================================
     def execute_signal_flip_close(self, active_trade: dict) -> float:
-        """Executes immediate market liquidation and bracket annihilation on opposite crossover."""
+        """Kills resting brackets and issues an immediate Market Close order."""
         trade_id  = active_trade.get("id")
         symbol    = active_trade["symbol"]
         direction = active_trade["direction"].upper()
@@ -412,16 +293,11 @@ class ExecutionEngine:
                 self.exchange.cancel_all_orders(symbol)
                 print(f"   --> All resting bracket orders annihilated for {symbol}.")
             except Exception:
-                for b_id in [active_trade.get("binance_tp_id"), active_trade.get("binance_sl_id")]:
-                    if b_id and "MOCK" not in str(b_id):
-                        try:
-                            self.exchange.cancel_order(b_id, symbol)
-                        except Exception:
-                            pass
+                pass
 
         # 2. Market Liquidation Order
         close_side = 'sell' if direction == 'LONG' else 'buy'
-        exit_price = float(active_trade["limit_entry_price"])
+        exit_price = float(active_trade["entry_price"])
         fees_paid  = 0.0
         realized_pnl = 0.0
 
@@ -440,50 +316,32 @@ class ExecutionEngine:
                 my_trades = self.exchange.fetch_my_trades(symbol, limit=2)
                 fees_paid = sum(float(t.get('fee', {}).get('cost', 0.0)) for t in my_trades if t.get('order') == close_res['id'])
                 
-                entry_fill = float(active_trade.get("actual_fill_price") or active_trade["limit_entry_price"])
+                entry_fill = float(active_trade["entry_price"])
                 gross_ret = (exit_price - entry_fill) / entry_fill if direction == 'LONG' else (entry_fill - exit_price) / entry_fill
                 realized_pnl = (float(active_trade["allocated_cash"]) * gross_ret) - fees_paid
             except Exception as e:
-                print(f"[Execution Error] Market close failed on Binance: {repr(e)}")
+                print(f"[Execution Error] Market flip close failed on Binance: {repr(e)}")
         else:
-            exit_price = float(active_trade["limit_entry_price"]) * 1.002
+            exit_price = float(active_trade["entry_price"]) * 1.002
             fees_paid  = float(active_trade["allocated_cash"]) * 0.0008
-            realized_pnl = 5.00
+            realized_pnl = 0.50
 
-        created_dt = pd.to_datetime(active_trade["created_at"], utc=True)
-        now_dt     = datetime.now(timezone.utc)
-        hold_min   = (now_dt - created_dt).total_seconds() / 60.0
-        idealized_pnl = realized_pnl + fees_paid
+        hold_min = max(0.1, (datetime.now(timezone.utc) - pd.to_datetime(active_trade["created_at"], utc=True)).total_seconds() / 60.0)
 
-        self.telemetry.record_trade_closure(
-            trade_id=trade_id,
-            close_reason="SIGNAL_FLIP",
-            exit_price=exit_price,
-            realized_binance_pnl=realized_pnl,
-            idealized_pnl=idealized_pnl,
-            exchange_fees_paid=fees_paid,
-            slippage_usd=0.0,
-            hold_duration_minutes=hold_min,
-            notes="Closed on confirmed 9/15 EMA opposite crossover",
-            symbol=symbol,
-            direction=direction,
-            entry_price=float(active_trade.get("actual_fill_price") or active_trade["limit_entry_price"])
-        )
+        self.telemetry.record_trade_closure({
+            "id": trade_id,
+            "symbol": symbol,
+            "direction": direction,
+            "trade_tier": active_trade.get("trade_tier", "MAIN"),
+            "close_reason": "SIGNAL_FLIP",
+            "entry_price": float(active_trade["entry_price"]),
+            "exit_price": exit_price,
+            "realized_binance_pnl": realized_pnl,
+            "idealized_pnl": realized_pnl + fees_paid,
+            "friction_loss": 0.0,
+            "exchange_fees_paid": fees_paid,
+            "hold_duration_minutes": hold_min,
+            "notes": "Closed on confirmed opposite 9/15 EMA crossover"
+        })
         print(f"   --> {symbol} {direction} closed @ ${exit_price:,.4f} (Net PnL: ${realized_pnl:+,.2f})")
         return realized_pnl
-
-
-# =============================================================================
-# STEP 11: Integration Self-Test Probe
-# =============================================================================
-if __name__ == "__main__":
-    print("===============================================================================")
-    print("  TESTING HARDENED EXECUTION CONNECTOR (src/execution.py)                      ")
-    print("===============================================================================")
-    engine = ExecutionEngine()
-    free_bal = engine.get_free_usdt_balance()
-    print(f"  Connected successfully. Free Balance: ${free_bal:,.2f} USDT")
-    
-    positions = engine.get_active_positions()
-    print(f"  Normalized Active Positions Detected: {positions}")
-    print("===============================================================================")

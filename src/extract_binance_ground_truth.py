@@ -1,48 +1,34 @@
 """
 ====================================================================================================
-ALGORITHM: src/extract_binance_ground_truth.py — Pure Binance Ground-Truth Extraction Engine
+ALGORITHM: src/extract_binance_ground_truth.py — Cumulative Upsert & Order Book Sweeper
 ====================================================================================================
 Purpose:
   Connects exclusively to Binance Futures Testnet via CCXT through the Frankfurt proxy tunnel.
-  Bypasses the Binance 7-day API constraint using rolling 7-day backward window pagination, scraping
-  100% of historical orders, execution fills, and wallet income without timestamp truncation.
-  Directly reconstructs planned vs. actual executions, entry/exit slippage, exchange commissions,
-  and friction loss derived exclusively from Binance matching engine data.
-  Resolves Pandas ISO datetime parsing by converting raw epoch integer timestamps directly.
-  Exports comprehensive CSV audit ledgers to `data/ground_truth/`, resets Supabase Table 1 (0/5 slots),
-  and populates Table 2 with verified Binance trade history.
-
-Microstructure Data Reconstructed Exclusively from Binance:
-  1. Planned/Predicted Entry Price: The exact limit price specified on the opening LIMIT order.
-  2. Actual Realized Entry Price  : The actual weighted average fill price (avgPrice) executed on Binance.
-  3. Entry Slippage ($)           : Dollar impact of actual entry execution vs. planned limit price.
-  4. Planned Exit Barrier         : The exact stopPrice configured on the resting STOP/TP bracket order.
-  5. Actual Realized Exit Price   : The actual execution price filled by the Binance matching engine.
-  6. Exit Slippage ($)            : Dollar impact of exit execution vs. planned stop/target barrier.
-  7. Exchange Fees Paid ($)       : Actual commissions deducted by Binance on both entry and exit legs.
-  8. Idealized PnL ($)            : Theoretical return if filled exactly at planned entry & planned barrier.
-  9. Realized Binance PnL ($)     : Actual net cash credited or debited by Binance matching engine.
-  10. Total Friction Loss ($)     : Idealized PnL ($) - Realized Binance PnL ($).
+  Executes an Order Book Sweeper to cancel all ancient open ghost orders dating back to September 13th.
+  Extracts 100% of historical fills, orders, and income using rolling 7-day window pagination without
+  timestamp truncation. Replaces destructive file overwriting with an append-and-deduplicate engine
+  (`upsert_csv`), ensuring historical data accumulates permanently into `data/ground_truth/`.
+  Resets Supabase Table 1 (0/5 slots) and repopulates Table 2 with authentic Binance trade history.
 
 Algorithm Steps:
   Step 1: Module Setup, Credentials Ingestion & Proxy Configuration.
   Step 2: CCXT Binance Futures Client Setup with Proxy Tunnel.
-  Step 3: Rolling 7-Day Window Pagination Across All 5 Assets:
+  Step 3: The Order Book Sweeper:
+          - Queries `fetch_open_orders()` across all 5 assets.
+          - Calls `cancel_all_orders()` to purge every ancient open order from Sept 13th to today.
+  Step 4: Rolling 7-Day Window Pagination Across All 5 Assets:
           - Scrape `fapiPrivateGetUserTrades` and `fapiPrivateGetAllOrders` for each symbol & window.
           - Scrape `fapiPrivateGetIncome` across the entire account balance history.
-  Step 4: Microstructure Matching Engine with Raw Epoch Integer Conversion:
-          - Convert raw millisecond timestamps directly via `pd.to_datetime(..., unit='ms', utc=True)`.
+  Step 5: Microstructure Matching Engine (Planned vs. Actual Frictions):
           - Match opening limit orders with closing bracket/market orders.
           - Calculate entry slippage, exit slippage, commissions, and friction loss.
-  Step 5: Export Master Audit CSV Artifacts to `data/ground_truth/`:
-          - `binance_comprehensive_audit_ledger.csv` (Primary Analysis Ledger)
-          - `binance_raw_trades_all.csv`
-          - `binance_raw_orders_all.csv`
-          - `binance_raw_income_all.csv`
-  Step 6: Supabase Table Sanitization & Direct Ingestion:
+  Step 6: Cumulative Upsert & CSV Persistence:
+          - Loads existing CSVs in `data/ground_truth/`, concatenates newly scraped records,
+            deduplicates by primary transaction IDs (`id`, `order_id`, `tranId`), sorts, and saves.
+  Step 7: Supabase Table Sanitization & Direct Ingestion:
           - Reset Table 1 (`testnet_active_trades`) to clean 0/5 active slots.
           - Repopulate Table 2 (`testnet_trade_log`) directly with reconstructed Binance ledger.
-  Step 7: Final Audit Summary & Scoreboard Display.
+  Step 8: Final Audit Summary & Scoreboard Display.
 ====================================================================================================
 """
 
@@ -151,7 +137,27 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # =============================================================================
-# STEP 3: Rolling 7-Day Window Pagination Across All 5 Assets
+# STEP 3: The Order Book Sweeper (Purging Ancient Orders from Sept 13 to Today)
+# =============================================================================
+print("\n===============================================================================")
+print("  EXECUTING BINANCE ORDER BOOK SWEEPER (PURGING GHOST ORDERS)                  ")
+print("===============================================================================")
+
+for sym in ACTIVE_SYMBOLS:
+    try:
+        open_orders = exchange.fetch_open_orders(sym)
+        if open_orders:
+            print(f"--> Found {len(open_orders)} open order(s) for {sym}. Purging all from matching engine...")
+            exchange.cancel_all_orders(sym)
+            print(f"    [PURGED] Successfully purged open orders for {sym}.")
+        else:
+            print(f"--> No open orders resting for {sym}.")
+    except Exception as e:
+        print(f"--> Notice sweeping orders for {sym}: {e}")
+
+
+# =============================================================================
+# STEP 4: Rolling 7-Day Window Pagination Across All 5 Assets
 # =============================================================================
 print("\n===============================================================================")
 print("  EXTRACTING ALL HISTORICAL BINANCE DATA (ROLLING 7-DAY WINDOW PAGINATION)     ")
@@ -174,7 +180,6 @@ for sym in ACTIVE_SYMBOLS:
     orders_sym_count = 0
 
     for start_ms, end_ms in time_windows:
-        # 1. Fetch User Trades (/fapi/v1/userTrades) within the 7-day window
         try:
             trades = exchange.fapiPrivateGetUserTrades({
                 'symbol': sym,
@@ -189,6 +194,7 @@ for sym in ACTIVE_SYMBOLS:
                         'id': t_id,
                         'order_id': str(t.get('orderId')),
                         'timestamp': int(t.get('time')),
+                        'datetime_utc': pd.to_datetime(int(t.get('time')), unit='ms', utc=True).isoformat(),
                         'symbol': sym,
                         'side': t.get('side', '').upper(),
                         'price': float(t.get('price', 0.0) or 0.0),
@@ -203,7 +209,6 @@ for sym in ACTIVE_SYMBOLS:
         except Exception:
             pass
 
-        # 2. Fetch All Orders (/fapi/v1/allOrders) within the 7-day window
         try:
             orders = exchange.fapiPrivateGetAllOrders({
                 'symbol': sym,
@@ -219,6 +224,8 @@ for sym in ACTIVE_SYMBOLS:
                         'client_order_id': o.get('clientOrderId'),
                         'timestamp': int(o.get('time')),
                         'update_timestamp': int(o.get('updateTime', o.get('time'))),
+                        'datetime_utc': pd.to_datetime(int(o.get('time')), unit='ms', utc=True).isoformat(),
+                        'update_utc': pd.to_datetime(int(o.get('updateTime', o.get('time'))), unit='ms', utc=True).isoformat(),
                         'symbol': sym,
                         'type': o.get('type'),
                         'side': o.get('side', '').upper(),
@@ -252,8 +259,9 @@ while True:
                 'income': float(inc.get('income', 0.0) or 0.0),
                 'asset': inc.get('asset'),
                 'timestamp': int(inc.get('time') or 0),
-                'tranId': inc.get('tranId'),
-                'tradeId': inc.get('tradeId')
+                'datetime_utc': pd.to_datetime(int(inc.get('time') or 0), unit='ms', utc=True).isoformat(),
+                'tranId': str(inc.get('tranId')),
+                'tradeId': str(inc.get('tradeId', ''))
             })
         if len(incomes) < 1000:
             break
@@ -269,21 +277,19 @@ df_raw_income = pd.DataFrame(raw_income_list)
 
 
 # =============================================================================
-# STEP 4: Microstructure Matching Engine (Planned vs. Actual Frictions)
+# STEP 5: Microstructure Matching Engine (Planned vs. Actual Frictions)
 # =============================================================================
-print("\n4. Reconstructing planned vs. actual executions and friction metrics...")
+print("\n5. Reconstructing planned vs. actual executions and friction metrics...")
 
 reconstructed_ledger = []
 
 if not df_raw_trades.empty and not df_raw_orders.empty:
-    # Vectorized conversion directly from integer millisecond timestamps (Immune to format errors)
     df_raw_trades['dt'] = pd.to_datetime(df_raw_trades['timestamp'], unit='ms', utc=True)
     df_raw_orders['dt'] = pd.to_datetime(df_raw_orders['timestamp'], unit='ms', utc=True)
     
     df_raw_trades = df_raw_trades.sort_values('dt').reset_index(drop=True)
     df_raw_orders = df_raw_orders.sort_values('dt').reset_index(drop=True)
 
-    # In Binance Futures, closing executions carry non-zero realizedPnl
     closing_trades = df_raw_trades[df_raw_trades['realized_pnl'] != 0.0].copy()
 
     for _, c_trade in closing_trades.iterrows():
@@ -295,7 +301,6 @@ if not df_raw_trades.empty and not df_raw_orders.empty:
         direction = "SHORT" if exit_side == "BUY" else "LONG"
         exit_order_id = c_trade['order_id']
 
-        # 1. Locate the opening execution fill prior to this exit fill
         prior_fills = df_raw_trades[
             (df_raw_trades['symbol'] == sym) &
             (df_raw_trades['dt'] < c_time) &
@@ -320,7 +325,6 @@ if not df_raw_trades.empty and not df_raw_orders.empty:
         total_fees_usd = entry_fee + exit_fee
         hold_min       = max(0.1, (c_time - open_dt).total_seconds() / 60.0)
 
-        # 2. Extract Planned Entry Price from Binance's original LIMIT order record
         entry_order_row = df_raw_orders[df_raw_orders['order_id'] == entry_order_id]
         if not entry_order_row.empty:
             planned_entry_px = entry_order_row.iloc[0]['planned_price']
@@ -329,7 +333,6 @@ if not df_raw_trades.empty and not df_raw_orders.empty:
         else:
             planned_entry_px = actual_entry_px
 
-        # 3. Extract Planned Exit Barrier from Binance's bracket/exit order record
         exit_order_row = df_raw_orders[df_raw_orders['order_id'] == exit_order_id]
         close_reason = "SIGNAL_FLIP"
         planned_exit_px = actual_exit_px
@@ -354,23 +357,16 @@ if not df_raw_trades.empty and not df_raw_orders.empty:
             else:
                 close_reason = "SIGNAL_FLIP"
 
-        # 4. Rigorous Friction & Slippage Decomposition
         dir_mult = 1.0 if direction == "LONG" else -1.0
-
-        # Entry Slippage ($): Difference between planned limit price and actual execution
         entry_slippage_usd = dir_mult * (planned_entry_px - actual_entry_px) * qty
+        exit_slippage_usd  = dir_mult * (planned_exit_px - actual_exit_px) * qty
 
-        # Exit Slippage ($): Difference between planned stop/target barrier and actual fill
-        exit_slippage_usd = dir_mult * (planned_exit_px - actual_exit_px) * qty
-
-        # Idealized PnL ($): Theoretical profit if filled perfectly at planned prices without slippage/fees
         if planned_entry_px > 0:
             idealized_gross_ret = dir_mult * (planned_exit_px - planned_entry_px) / planned_entry_px
             idealized_pnl_usd   = (planned_entry_px * qty) * idealized_gross_ret
         else:
             idealized_pnl_usd   = realized_binance_pnl
 
-        # Total Friction Loss ($): Delta between Theoretical Alpha and Realized Cash
         total_friction_loss_usd = idealized_pnl_usd - realized_binance_pnl
 
         reconstructed_ledger.append({
@@ -403,32 +399,57 @@ print(f"   --> Successfully reconstructed {len(df_reconstructed)} complete trade
 
 
 # =============================================================================
-# STEP 5: Export CSV Artifacts to data/ground_truth/
+# STEP 6: Cumulative Upsert & CSV Persistence (Append and Deduplicate)
 # =============================================================================
-print("\n5. Exporting uncapped ground-truth CSV ledgers to data/ground_truth/...")
+print("\n6. Appending and deduplicating CSV ledgers (Zero Overwrite Loss)...")
+
+def upsert_csv(file_path: str, new_df: pd.DataFrame, dedup_col: str, sort_col: str = None) -> pd.DataFrame:
+    """
+    Appends new data to existing CSV files, deduplicating on primary keys.
+    Guarantees historical data is never wiped out.
+    """
+    if new_df.empty:
+        if os.path.exists(file_path):
+            return pd.read_csv(file_path)
+        return new_df
+
+    if os.path.exists(file_path):
+        try:
+            existing_df = pd.read_csv(file_path)
+            combined = pd.concat([existing_df, new_df], axis=0, ignore_index=True)
+            combined[dedup_col] = combined[dedup_col].astype(str)
+            deduped = combined.drop_duplicates(subset=[dedup_col], keep='last')
+            if sort_col and sort_col in deduped.columns:
+                deduped = deduped.sort_values(sort_col).reset_index(drop=True)
+            deduped.to_csv(file_path, index=False)
+            return deduped
+        except Exception as e:
+            print(f"Notice loading existing CSV ({file_path}): {e}")
+
+    new_df.to_csv(file_path, index=False)
+    return new_df
 
 master_csv_path  = os.path.join(DATA_DIR, "binance_comprehensive_audit_ledger.csv")
 trades_csv_path  = os.path.join(DATA_DIR, "binance_raw_trades_all.csv")
 orders_csv_path  = os.path.join(DATA_DIR, "binance_raw_orders_all.csv")
 income_csv_path  = os.path.join(DATA_DIR, "binance_raw_income_all.csv")
 
-df_reconstructed.to_csv(master_csv_path, index=False)
-df_raw_trades.to_csv(trades_csv_path, index=False)
-df_raw_orders.to_csv(orders_csv_path, index=False)
-df_raw_income.to_csv(income_csv_path, index=False)
+final_trades_df = upsert_csv(trades_csv_path, df_raw_trades, dedup_col='id', sort_col='timestamp')
+final_orders_df = upsert_csv(orders_csv_path, df_raw_orders, dedup_col='order_id', sort_col='timestamp')
+final_income_df = upsert_csv(income_csv_path, df_raw_income, dedup_col='tranId', sort_col='timestamp')
+final_recon_df  = upsert_csv(master_csv_path, df_reconstructed, dedup_col='exit_order_id', sort_col='closed_at_utc')
 
-print(f"   [Primary Audit Ledger] {master_csv_path}")
-print(f"   [Raw Fills]            {trades_csv_path}")
-print(f"   [Raw Orders]           {orders_csv_path}")
-print(f"   [Raw Income]           {income_csv_path}")
+print(f"   [Cumulative Ledger] {master_csv_path} (Total Records: {len(final_recon_df)})")
+print(f"   [Cumulative Fills]  {trades_csv_path} (Total Fills: {len(final_trades_df)})")
+print(f"   [Cumulative Orders] {orders_csv_path} (Total Orders: {len(final_orders_df)})")
+print(f"   [Cumulative Income] {income_csv_path} (Total Income: {len(final_income_df)})")
 
 
 # =============================================================================
-# STEP 6: Supabase Table Sanitization & Direct Ingestion
+# STEP 7: Supabase Table Sanitization & Direct Ingestion
 # =============================================================================
-print("\n6. Sanitizing Supabase tables directly from Binance ground truth...")
+print("\n7. Sanitizing Supabase tables directly from Binance ground truth...")
 
-# 1. Reset Table 1 (testnet_active_trades) -> Clean 0/5 slots baseline
 try:
     print("   --> Resetting Table 1 (testnet_active_trades)...")
     supabase.table("testnet_active_trades").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
@@ -436,7 +457,6 @@ try:
 except Exception as e:
     print(f"       Notice resetting Table 1: {e}")
 
-# 2. Preserve clean GATE_REJECTED model prediction audits
 preserved_rejections = []
 try:
     print("   --> Preserving clean GATE_REJECTED model prediction audits...")
@@ -447,14 +467,12 @@ try:
 except Exception as e:
     print(f"       Notice preserving rejections: {e}")
 
-# 3. Purge old corrupted execution rows from Table 2
 try:
     print("   --> Purging corrupted execution rows from Table 2 (testnet_trade_log)...")
     supabase.table("testnet_trade_log").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
 except Exception as e:
     print(f"       Notice purging Table 2: {e}")
 
-# 4. Re-insert preserved GATE_REJECTED rows
 if preserved_rejections:
     try:
         clean_rejs = []
@@ -467,18 +485,17 @@ if preserved_rejections:
     except Exception as e:
         print(f"       Notice restoring rejections: {e}")
 
-# 5. Populate Table 2 directly with authentic Binance reconstructed records
-if not df_reconstructed.empty:
-    print("   --> Ingesting authentic Binance execution rows into Table 2...")
+if not final_recon_df.empty:
+    print("   --> Ingesting cumulative authentic Binance execution rows into Table 2...")
     ingest_payload = []
-    for _, t in df_reconstructed.iterrows():
+    for _, t in final_recon_df.iterrows():
         ingest_payload.append({
             "trade_id": None,
-            "created_at": t['opened_at_utc'],
-            "closed_at": t['closed_at_utc'],
-            "symbol": t['symbol'],
-            "direction": t['direction'],
-            "close_reason": t['close_reason'],
+            "created_at": str(t['opened_at_utc']),
+            "closed_at": str(t['closed_at_utc']),
+            "symbol": str(t['symbol']),
+            "direction": str(t['direction']),
+            "close_reason": str(t['close_reason']),
             "entry_price": float(t['actual_entry_price']),
             "exit_price": float(t['actual_exit_price']),
             "realized_binance_pnl": float(t['realized_binance_pnl']),
@@ -487,7 +504,7 @@ if not df_reconstructed.empty:
             "exchange_fees_paid": float(t['exchange_fees_paid']),
             "slippage_usd": float(t['entry_slippage_usd'] + t['exit_slippage_usd']),
             "hold_duration_minutes": float(t['hold_duration_minutes']),
-            "notes": t['notes']
+            "notes": str(t['notes'])
         })
 
     try:
@@ -498,27 +515,23 @@ if not df_reconstructed.empty:
 
 
 # =============================================================================
-# STEP 7: Final Audit Summary & Scoreboard Display
+# STEP 8: Final Audit Summary & Scoreboard Display
 # =============================================================================
-tot_pnl_usd   = df_reconstructed['realized_binance_pnl'].sum() if not df_reconstructed.empty else 0.0
-tot_fees_usd  = df_reconstructed['exchange_fees_paid'].sum() if not df_reconstructed.empty else 0.0
-tot_fric_usd  = df_reconstructed['total_friction_loss_usd'].sum() if not df_reconstructed.empty else 0.0
-tot_ideal_usd = df_reconstructed['idealized_pnl_usd'].sum() if not df_reconstructed.empty else 0.0
+tot_pnl_usd   = final_recon_df['realized_binance_pnl'].sum() if not final_recon_df.empty else 0.0
+tot_fees_usd  = final_recon_df['exchange_fees_paid'].sum() if not final_recon_df.empty else 0.0
+tot_fric_usd  = final_recon_df['total_friction_loss_usd'].sum() if not final_recon_df.empty else 0.0
+tot_ideal_usd = final_recon_df['idealized_pnl_usd'].sum() if not final_recon_df.empty else 0.0
 net_cash_usd  = tot_pnl_usd - tot_fees_usd
 
 print("\n===============================================================================")
-print("                   FINAL GROUND-TRUTH AUDIT SCOREBOARD                         ")
+print("                   CUMULATIVE GROUND-TRUTH AUDIT SCOREBOARD                    ")
 print("===============================================================================")
-print(f"Total Fills Scraped from Binance     : {len(df_raw_trades):,}")
-print(f"Total Orders Scraped from Binance    : {len(df_raw_orders):,}")
-print(f"Completed Reconstructed Trades       : {len(df_reconstructed):,}")
+print(f"Total Cumulative Fills Scraped       : {len(final_trades_df):,}")
+print(f"Total Cumulative Orders Scraped      : {len(final_orders_df):,}")
+print(f"Total Cumulative Trades Reconstructed: {len(final_recon_df):,}")
 print(f"Theoretical Idealized Model PnL      : ${tot_ideal_usd:+,.2f} USDT")
 print(f"Realized Gross Binance PnL           : ${tot_pnl_usd:+,.2f} USDT")
 print(f"Total True Binance Exchange Fees     : ${tot_fees_usd:,.2f} USDT")
 print(f"Total Execution Friction Loss        : ${tot_fric_usd:,.2f} USDT")
 print(f"True Net Cash Delta on Binance       : ${net_cash_usd:+,.2f} USDT")
-print("-------------------------------------------------------------------------------")
-print("Supabase Direct Ingestion Status:")
-print("  • Table 1 (testnet_active_trades)  : Reset (Clean Slate, 0/5 Active Slots)")
-print("  • Table 2 (testnet_trade_log)      : Overwritten Directly with Binance Ground Truth")
 print("===============================================================================\n")

@@ -1,21 +1,21 @@
 """
 ====================================================================================================
-ALGORITHM: src/telemetry.py — Cold-Start Hydration & Write-Through Telemetry Sink
+ALGORITHM: src/telemetry.py — Direct 3-Table Relational Schema Telemetry Sink
 ====================================================================================================
 Purpose:
-  Provides an institutional persistence layer for Supabase. Eliminates runtime read polling by
-  hydrating active trade state into RAM ONCE at startup (`hydrate_active_trades_from_db`). During
-  runtime, functions purely as an asynchronous write-through telemetry sink for orders, fills,
-  closures, and gate rejection audits.
+  Provides the persistence layer directly matching the clean 3-table Supabase schema:
+    1. Table 1 (`testnet_active_trades`): Current in-flight open positions (max 5 rows).
+    2. Table 2 (`testnet_trade_log`): Master closed trade execution receipts with trade_tier tags.
+    3. Table 3 (`crossover_telemetry_stream`): 100% of crossover events with raw model predictions.
+  Eliminates read polling during steady-state trading (hydrates once on boot).
 
 Algorithm Steps:
-  Step 1: Module Setup, Client Ingestion & Environment Configuration.
-  Step 2: TelemetryEngine Class Definition.
-  Step 3: Resilient Write Wrapper (`_execute_with_retry`).
-  Step 4: Startup Hydration Handler (`hydrate_active_trades_from_db`).
-  Step 5: Write-Through State Machine Handlers (record_new_order, record_order_fill, record_bracket_order_ids).
-  Step 6: Forensic Archive & Rejection Handlers (record_trade_closure, record_missed_trade, record_rejected_signal).
-  Step 7: Built-In Integration Self-Test (`if __name__ == '__main__'`).
+  Step 1: Module Setup & Supabase Client Ingestion.
+  Step 2: Resilient Execution Wrapper (`_execute_with_retry`).
+  Step 3: Startup Hydration Handler (`hydrate_active_trades_from_db`).
+  Step 4: Table 1 In-Flight State Handlers (`record_active_trade`, `clear_active_trade`).
+  Step 5: Table 2 Terminal Trade Logging (`record_trade_closure`).
+  Step 6: Table 3 Real-Time Crossover Stream Logging (`record_crossover_telemetry`).
 ====================================================================================================
 """
 
@@ -37,7 +37,7 @@ else:
     SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("[FATAL] SUPABASE_URL or SUPABASE_KEY missing from environment/secrets!")
+    raise RuntimeError("[FATAL] Supabase credentials missing from environment!")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -45,8 +45,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 class TelemetryEngine:
     def __init__(self, client: Client = supabase):
         self.db = client
-        self.active_table = "testnet_active_trades"
-        self.log_table    = "testnet_trade_log"
+        self.table_active = "testnet_active_trades"
+        self.table_log    = "testnet_trade_log"
+        self.table_stream = "crossover_telemetry_stream"
 
     def _execute_with_retry(self, operation_fn, max_retries: int = 3, initial_delay: float = 2.0):
         delay = initial_delay
@@ -57,232 +58,77 @@ class TelemetryEngine:
                 return operation_fn()
             except Exception as e:
                 last_exception = e
-                err_str = str(e).lower()
-                if "504" in err_str or "timeout" in err_str or "connection" in err_str:
-                    time.sleep(delay)
-                    delay *= 2.0
-                else:
-                    raise e
+                time.sleep(delay)
+                delay *= 2.0
 
         raise last_exception
 
+    # ── 1. Startup Hydration (One Read on Boot) ──
     def hydrate_active_trades_from_db(self) -> dict:
-        """Queries Table 1 ONCE upon daemon boot. Zero SELECT queries during steady-state trading."""
         try:
             def op():
-                return self.db.table(self.active_table).select("*").in_("order_status", ["PENDING_LIMIT", "FILLED"]).execute()
-            res = self._execute_with_retry(op, max_retries=3, initial_delay=2.0)
+                return self.db.table(self.table_active).select("*").eq("order_status", "FILLED").execute()
+            res = self._execute_with_retry(op, max_retries=3)
             rows = res.data if res.data else []
             active_cache = {r["symbol"]: r for r in rows}
-            print(f"[State Hydration] Successfully hydrated {len(active_cache)} active trade(s) from Supabase.")
+            print(f"[State Hydration] Successfully hydrated {len(active_cache)} active trade(s) from Supabase Table 1.")
             return active_cache
         except Exception as e:
-            print(f"[State Hydration Warning] Could not hydrate state from Supabase ({e}). Starting with empty cache.")
+            print(f"[State Hydration Notice] Starting with clean in-memory state: {e}")
             return {}
 
-    def get_active_trades(self) -> list:
-        """Returns empty list if DB offline or returns active trades."""
+    # ── 2. Table 1: In-Flight State Handlers ──
+    def record_active_trade(self, trade_payload: dict) -> str:
+        def op():
+            return self.db.table(self.table_active).upsert(trade_payload, on_conflict="symbol").execute()
         try:
-            def op():
-                return self.db.table(self.active_table).select("*").in_("order_status", ["PENDING_LIMIT", "FILLED"]).execute()
-            res = self._execute_with_retry(op, max_retries=2, initial_delay=1.0)
-            return res.data if res.data else []
+            res = self._execute_with_retry(op, max_retries=3)
+            if res.data and len(res.data) > 0:
+                return str(res.data[0]["id"])
+        except Exception as e:
+            print(f"[Telemetry Warning] Table 1 upsert notice: {e}")
+        return None
+
+    def clear_active_trade(self, symbol: str):
+        def op():
+            return self.db.table(self.table_active).delete().eq("symbol", symbol).execute()
+        try:
+            self._execute_with_retry(op, max_retries=3)
         except Exception:
-            return []
+            pass
 
-    def record_new_order(
-        self,
-        symbol: str,
-        direction: str,
-        candle_close_utc: str,
-        signal_price: float,
-        limit_entry_price: float,
-        allocated_cash: float,
-        contract_quantity: float,
-        dynamic_tp_price: float,
-        dynamic_sl_price: float,
-        idealized_tp_pct: float,
-        idealized_sl_pct: float,
-        category_tag: str,
-        risk_budget_usd: float,
-        binance_order_id: str = None
-    ) -> str:
-        payload = {
-            "candle_close_utc": candle_close_utc,
-            "symbol": symbol,
-            "direction": direction,
-            "signal_price": float(signal_price),
-            "limit_entry_price": float(limit_entry_price),
-            "allocated_cash": float(allocated_cash),
-            "contract_quantity": float(contract_quantity),
-            "dynamic_tp_price": float(dynamic_tp_price),
-            "dynamic_sl_price": float(dynamic_sl_price),
-            "idealized_tp_pct": float(idealized_tp_pct),
-            "idealized_sl_pct": float(idealized_sl_pct),
-            "category_tag": category_tag,
-            "risk_budget_usd": float(risk_budget_usd),
-            "order_status": "PENDING_LIMIT",
-            "binance_order_id": str(binance_order_id) if binance_order_id else None
-        }
-        def op():
-            return self.db.table(self.active_table).insert(payload).execute()
-        res = self._execute_with_retry(op, max_retries=3)
-        if res.data and len(res.data) > 0:
-            return res.data[0]["id"]
-        raise RuntimeError(f"[Telemetry Error] Failed to insert new order for {symbol}")
-
-    def record_order_fill(self, trade_id: str, actual_fill_price: float):
-        payload = {
-            "order_status": "FILLED",
-            "actual_fill_price": float(actual_fill_price)
-        }
-        def op():
-            return self.db.table(self.active_table).update(payload).eq("id", trade_id).execute()
-        try:
-            self._execute_with_retry(op, max_retries=3)
-        except Exception as e:
-            print(f"[Telemetry Warning] Could not record fill in DB ({e}). Continuing.")
-
-    def record_bracket_order_ids(self, trade_id: str, binance_tp_id: str, binance_sl_id: str):
-        payload = {
-            "binance_tp_id": str(binance_tp_id),
-            "binance_sl_id": str(binance_sl_id)
-        }
-        def op():
-            return self.db.table(self.active_table).update(payload).eq("id", trade_id).execute()
-        try:
-            self._execute_with_retry(op, max_retries=3)
-        except Exception as e:
-            print(f"[Telemetry Warning] Could not record bracket IDs in DB ({e}). Continuing.")
-
-    def record_trade_closure(
-        self,
-        trade_id: str,
-        close_reason: str,
-        exit_price: float,
-        realized_binance_pnl: float,
-        idealized_pnl: float,
-        exchange_fees_paid: float,
-        slippage_usd: float,
-        hold_duration_minutes: float,
-        notes: str = None,
-        symbol: str = None,
-        direction: str = None,
-        entry_price: float = None
-    ):
-        trade = None
-        if trade_id:
-            try:
-                def fetch_op():
-                    return self.db.table(self.active_table).select("*").eq("id", trade_id).execute()
-                res = self._execute_with_retry(fetch_op, max_retries=2)
-                if res.data and len(res.data) > 0:
-                    trade = res.data[0]
-            except Exception:
-                pass
-
-        sym = trade["symbol"] if trade else (symbol or "UNKNOWN")
-        side = trade["direction"] if trade else (direction or "UNKNOWN")
-        entry_px = float(trade.get("actual_fill_price") or trade.get("limit_entry_price") or entry_price or exit_price) if trade else float(entry_price or exit_price)
-        friction_loss = float(idealized_pnl) - float(realized_binance_pnl)
-
-        log_payload = {
-            "trade_id": trade["id"] if trade else None,
-            "closed_at": datetime.now(timezone.utc).isoformat(),
-            "symbol": sym,
-            "direction": side,
-            "close_reason": close_reason,
-            "entry_price": entry_px,
-            "exit_price": float(exit_price),
-            "realized_binance_pnl": float(realized_binance_pnl),
-            "idealized_pnl": float(idealized_pnl),
-            "friction_loss": round(friction_loss, 4),
-            "exchange_fees_paid": float(exchange_fees_paid),
-            "slippage_usd": float(slippage_usd),
-            "hold_duration_minutes": float(hold_duration_minutes),
-            "notes": notes or f"Closed via {close_reason}"
-        }
+    # ── 3. Table 2: Terminal Execution Receipts ──
+    def record_trade_closure(self, closure_payload: dict):
+        # 1. Insert into Table 2
+        def insert_op():
+            return self.db.table(self.table_log).insert({
+                "symbol": closure_payload["symbol"],
+                "direction": closure_payload["direction"],
+                "trade_tier": closure_payload.get("trade_tier", "MAIN"),
+                "close_reason": closure_payload["close_reason"],
+                "entry_price": float(closure_payload["entry_price"]),
+                "exit_price": float(closure_payload["exit_price"]),
+                "realized_binance_pnl": float(closure_payload["realized_binance_pnl"]),
+                "idealized_pnl": float(closure_payload.get("idealized_pnl", closure_payload["realized_binance_pnl"])),
+                "friction_loss": float(closure_payload.get("friction_loss", 0.0)),
+                "exchange_fees_paid": float(closure_payload["exchange_fees_paid"]),
+                "hold_duration_minutes": float(closure_payload.get("hold_duration_minutes", 1.0)),
+                "notes": closure_payload.get("notes", "Executed on Binance")
+            }).execute()
 
         try:
-            def insert_op():
-                return self.db.table(self.log_table).insert(log_payload).execute()
             self._execute_with_retry(insert_op, max_retries=3)
         except Exception as e:
-            print(f"[Telemetry Warning] Could not write trade log to DB ({e}). Continuing.")
+            print(f"[Telemetry Warning] Table 2 insert notice: {e}")
 
-        if trade:
-            try:
-                def update_op():
-                    return self.db.table(self.active_table).update({"order_status": "CLOSED"}).eq("id", trade["id"]).execute()
-                self._execute_with_retry(update_op, max_retries=2)
-            except Exception:
-                pass
+        # 2. Delete from Table 1 to free the slot
+        self.clear_active_trade(closure_payload["symbol"])
 
-    def record_missed_trade(self, trade_id: str, notes: str = "Limit entry expired unfilled after 15m"):
-        trade = None
-        if trade_id:
-            try:
-                def fetch_op():
-                    return self.db.table(self.active_table).select("*").eq("id", trade_id).execute()
-                res = self._execute_with_retry(fetch_op, max_retries=2)
-                if res.data and len(res.data) > 0:
-                    trade = res.data[0]
-            except Exception:
-                pass
-
-        if not trade:
-            return
-
-        log_payload = {
-            "trade_id": trade["id"],
-            "closed_at": datetime.now(timezone.utc).isoformat(),
-            "symbol": trade["symbol"],
-            "direction": trade["direction"],
-            "close_reason": "MISSED_TRADE",
-            "entry_price": float(trade["limit_entry_price"]),
-            "exit_price": float(trade["limit_entry_price"]),
-            "realized_binance_pnl": 0.0,
-            "idealized_pnl": 0.0,
-            "friction_loss": 0.0,
-            "exchange_fees_paid": 0.0,
-            "slippage_usd": 0.0,
-            "hold_duration_minutes": 15.0,
-            "notes": notes
-        }
-
+    # ── 4. Table 3: 100% Crossover Sensor Stream (Feeds Your Dashboard) ──
+    def record_crossover_telemetry(self, telemetry_payload: dict):
+        def op():
+            return self.db.table(self.table_stream).insert(telemetry_payload).execute()
         try:
-            def insert_op():
-                return self.db.table(self.log_table).insert(log_payload).execute()
-            self._execute_with_retry(insert_op, max_retries=3)
-
-            def update_op():
-                return self.db.table(self.active_table).update({"order_status": "CANCELLED_MISSED"}).eq("id", trade_id).execute()
-            self._execute_with_retry(update_op, max_retries=2)
+            self._execute_with_retry(op, max_retries=2)
         except Exception as e:
-            print(f"[Telemetry Warning] Could not record missed trade in DB ({e}). Continuing.")
-
-    def record_rejected_signal(self, symbol: str, direction: str, signal_price: float, manifest: dict):
-        notes_str = f"{manifest.get('rejection_reason', 'REJECTED')} | Tag: {manifest.get('gate_combo_tag', 'N/A')} | R:R: {manifest.get('rr_ratio', 0.0)}"
-        log_payload = {
-            "trade_id": None,
-            "closed_at": datetime.now(timezone.utc).isoformat(),
-            "symbol": symbol,
-            "direction": direction,
-            "close_reason": "GATE_REJECTED",
-            "entry_price": float(signal_price),
-            "exit_price": float(signal_price),
-            "realized_binance_pnl": 0.0,
-            "idealized_pnl": 0.0,
-            "friction_loss": 0.0,
-            "exchange_fees_paid": 0.0,
-            "slippage_usd": 0.0,
-            "hold_duration_minutes": 0.0,
-            "notes": notes_str
-        }
-
-        try:
-            def insert_op():
-                return self.db.table(self.log_table).insert(log_payload).execute()
-            self._execute_with_retry(insert_op, max_retries=3)
-        except Exception as e:
-            print(f"[Telemetry Warning] Could not record rejection to DB ({e}). Continuing.")
+            print(f"[Telemetry Stream Notice] Failed to log crossover telemetry: {e}")

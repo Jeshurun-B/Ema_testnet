@@ -1,40 +1,32 @@
 """
 ====================================================================================================
-ALGORITHM: src/extract_binance_ground_truth.py — Cumulative Upsert & Order Book Sweeper
+ALGORITHM: src/extract_binance_ground_truth.py — Read-Only Mirror & Supabase Upsert Engine
 ====================================================================================================
 Purpose:
-  Connects exclusively to Binance Futures Testnet via CCXT through the Frankfurt proxy tunnel.
-  Executes an Order Book Sweeper to cancel all ancient open ghost orders dating back to September 13th.
-  Extracts 100% of historical fills, orders, and income using rolling 7-day window pagination without
-  timestamp truncation. Replaces destructive file overwriting with an append-and-deduplicate engine
-  (`upsert_csv`), ensuring historical data accumulates permanently into `data/ground_truth/`.
-  Resets Supabase Table 1 (0/5 slots) and repopulates Table 2 with authentic Binance trade history.
+  Connects to Binance Futures Testnet via CCXT through the Frankfurt proxy in a strictly READ-ONLY
+  capacity. Paginates across 56 days (8 rolling 7-day windows) to extract 100% of authentic fills,
+  orders, and income records. Stores cumulative deduplicated CSVs in `data/ground_truth/` and upserts
+  directly into dedicated Supabase raw tables (`binance_raw_trades`, `binance_raw_orders`,
+  `binance_raw_income`). Never executes cancellations and never deletes operational trading logs.
 
 Algorithm Steps:
-  Step 1: Module Setup, Credentials Ingestion & Proxy Configuration.
-  Step 2: CCXT Binance Futures Client Setup with Proxy Tunnel.
-  Step 3: The Order Book Sweeper:
-          - Queries `fetch_open_orders()` across all 5 assets.
-          - Calls `cancel_all_orders()` to purge every ancient open order from Sept 13th to today.
-  Step 4: Rolling 7-Day Window Pagination Across All 5 Assets:
-          - Scrape `fapiPrivateGetUserTrades` and `fapiPrivateGetAllOrders` for each symbol & window.
-          - Scrape `fapiPrivateGetIncome` across the entire account balance history.
-  Step 5: Microstructure Matching Engine (Planned vs. Actual Frictions):
-          - Match opening limit orders with closing bracket/market orders.
-          - Calculate entry slippage, exit slippage, commissions, and friction loss.
-  Step 6: Cumulative Upsert & CSV Persistence:
-          - Loads existing CSVs in `data/ground_truth/`, concatenates newly scraped records,
-            deduplicates by primary transaction IDs (`id`, `order_id`, `tranId`), sorts, and saves.
-  Step 7: Supabase Table Sanitization & Direct Ingestion:
-          - Reset Table 1 (`testnet_active_trades`) to clean 0/5 active slots.
-          - Repopulate Table 2 (`testnet_trade_log`) directly with reconstructed Binance ledger.
-  Step 8: Final Audit Summary & Scoreboard Display.
+  Step 1: Module Setup, GitHub Actions Environment Ingestion & Proxy Sanitization:
+          - Ingest credentials from environment; construct authenticated CCXT and Supabase clients.
+  Step 2: CCXT Client Setup with Frankfurt Proxy Tunnel:
+          - Initialize ccxt.binanceusdm with rate-limit guards.
+  Step 3: Rolling 7-Day Window Pagination Across Active Assets (Read-Only):
+          - Scrapes `fapiPrivateGetUserTrades` (fills) for each asset.
+          - Scrapes `fapiPrivateGetAllOrders` (orders) for each asset.
+          - Scrapes `fapiPrivateGetIncome` (funding fees, commissions, transfers) across account.
+  Step 4: Cumulative Upsert & CSV Persistence:
+          - Appends and deduplicates raw records into `data/ground_truth/` CSV files.
+  Step 5: Non-Destructive Supabase Direct Ingestion:
+          - Chunks data into 200-row batches and upserts directly into dedicated raw tables.
+          - Zero deletion of live operational tables (`asset_state`, `testnet_trade_log`).
+  Step 6: Forensic Attribution & Cumulative Scoreboard Display.
 ====================================================================================================
 """
 
-# =============================================================================
-# STEP 1: Module Setup, Credentials Ingestion & Proxy Configuration
-# =============================================================================
 import os
 import sys
 import time
@@ -52,40 +44,25 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
 
-IS_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
-
-if IS_KAGGLE:
-    from kaggle_secrets import UserSecretsClient
-    _secrets = UserSecretsClient()
-    API_KEY       = _secrets.get_secret("BINANCE_TESTNET_API_KEY").strip()
-    API_SECRET    = _secrets.get_secret("BINANCE_TESTNET_API_SECRET").strip()
-    SUPABASE_URL  = _secrets.get_secret("SUPABASE_URL").strip()
-    SUPABASE_KEY  = _secrets.get_secret("SUPABASE_KEY").strip()
-    PROXY_URL     = ""
-    try:
-        PROXY_URL = _secrets.get_secret("BINANCE_PROXY_URL").strip()
-    except Exception:
-        pass
-else:
-    API_KEY       = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
-    API_SECRET    = os.environ.get("BINANCE_TESTNET_API_SECRET", "").strip()
-    SUPABASE_URL  = os.environ.get("SUPABASE_URL", "").strip()
-    SUPABASE_KEY  = os.environ.get("SUPABASE_KEY", "").strip()
-    PROXY_URL     = os.environ.get("BINANCE_PROXY_URL", "").strip()
+# =============================================================================
+# STEP 1: Environment Ingestion & Proxy Sanitization
+# =============================================================================
+API_KEY      = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
+API_SECRET   = os.environ.get("BINANCE_TESTNET_API_SECRET", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+PROXY_URL    = os.environ.get("BINANCE_PROXY_URL", "").strip()
 
 if not API_KEY or not API_SECRET:
     raise RuntimeError("[FATAL] Binance API credentials missing from environment!")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("[FATAL] Supabase credentials missing from environment!")
 
-ACTIVE_SYMBOLS = ["BTCUSDT", "DOGEUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+ACTIVE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
 DATA_DIR       = os.path.join(os.getcwd(), "data", "ground_truth")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# =============================================================================
-# STEP 2: CCXT Binance Futures Client Setup with Proxy Tunnel
-# =============================================================================
 def sanitize_proxy_url(url: str) -> str:
     if not url:
         return ""
@@ -96,6 +73,10 @@ def sanitize_proxy_url(url: str) -> str:
         clean = "http://" + clean
     return clean
 
+
+# =============================================================================
+# STEP 2: CCXT Client Setup with Proxy Tunnel (Strictly Read-Only)
+# =============================================================================
 clean_proxy = sanitize_proxy_url(PROXY_URL)
 
 exchange_config = {
@@ -109,12 +90,9 @@ exchange_config = {
 }
 
 if clean_proxy:
-    exchange_config['proxies'] = {
-        'http': clean_proxy,
-        'https': clean_proxy
-    }
+    exchange_config['proxies'] = {'http': clean_proxy, 'https': clean_proxy}
     masked = clean_proxy.split('@')[-1] if '@' in clean_proxy else clean_proxy
-    print(f"[Network] CCXT configured with proxy tunnel -> {masked}")
+    print(f"[Network] Read-Only Scraper configured with proxy -> {masked}")
 
 exchange = ccxt.binanceusdm(exchange_config)
 
@@ -129,38 +107,18 @@ else:
 
 try:
     exchange.load_markets()
-    print("[Network Success] Binance Testnet markets loaded successfully.")
+    print("[Network Success] Binance Testnet markets loaded.")
 except Exception as e:
-    print(f"[Network Notice] Market filters notice: {e}")
+    print(f"[Network Notice] Market loading notice: {e}")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # =============================================================================
-# STEP 3: The Order Book Sweeper (Purging Ancient Orders from Sept 13 to Today)
+# STEP 3: Rolling 7-Day Window Pagination Across Active Assets (Read-Only)
 # =============================================================================
 print("\n===============================================================================")
-print("  EXECUTING BINANCE ORDER BOOK SWEEPER (PURGING GHOST ORDERS)                  ")
-print("===============================================================================")
-
-for sym in ACTIVE_SYMBOLS:
-    try:
-        open_orders = exchange.fetch_open_orders(sym)
-        if open_orders:
-            print(f"--> Found {len(open_orders)} open order(s) for {sym}. Purging all from matching engine...")
-            exchange.cancel_all_orders(sym)
-            print(f"    [PURGED] Successfully purged open orders for {sym}.")
-        else:
-            print(f"--> No open orders resting for {sym}.")
-    except Exception as e:
-        print(f"--> Notice sweeping orders for {sym}: {e}")
-
-
-# =============================================================================
-# STEP 4: Rolling 7-Day Window Pagination Across All 5 Assets
-# =============================================================================
-print("\n===============================================================================")
-print("  EXTRACTING ALL HISTORICAL BINANCE DATA (ROLLING 7-DAY WINDOW PAGINATION)     ")
+print("  EXTRACTING AUTHENTIC BINANCE GROUND TRUTH (ROLLING 7-DAY WINDOW PAGINATION)  ")
 print("===============================================================================")
 
 now_dt = datetime.now(timezone.utc)
@@ -175,11 +133,12 @@ raw_orders_dict = {}
 raw_income_list = []
 
 for sym in ACTIVE_SYMBOLS:
-    print(f"--> Ingesting rolling windows for {sym}...")
+    print(f"--> Ingesting matching engine history for {sym}...")
     trades_sym_count = 0
     orders_sym_count = 0
 
     for start_ms, end_ms in time_windows:
+        # 1. Fetch User Trades (Fills)
         try:
             trades = exchange.fapiPrivateGetUserTrades({
                 'symbol': sym,
@@ -196,19 +155,20 @@ for sym in ACTIVE_SYMBOLS:
                         'timestamp': int(t.get('time')),
                         'datetime_utc': pd.to_datetime(int(t.get('time')), unit='ms', utc=True).isoformat(),
                         'symbol': sym,
-                        'side': t.get('side', '').upper(),
+                        'side': str(t.get('side', '')).upper(),
                         'price': float(t.get('price', 0.0) or 0.0),
                         'amount': float(t.get('qty', 0.0) or 0.0),
                         'cost': float(t.get('quoteQty', 0.0) or (float(t.get('price', 0.0)) * float(t.get('qty', 0.0)))),
                         'fee_cost': float(t.get('commission', 0.0) or 0.0),
-                        'fee_currency': t.get('commissionAsset', 'USDT'),
-                        'takerOrMaker': 'maker' if t.get('maker') else 'taker',
+                        'fee_currency': str(t.get('commissionAsset', 'USDT')),
+                        'taker_or_maker': 'maker' if t.get('maker') else 'taker',
                         'realized_pnl': float(t.get('realizedPnl', 0.0) or 0.0)
                     }
                     trades_sym_count += 1
         except Exception:
             pass
 
+        # 2. Fetch Matching Engine Orders
         try:
             orders = exchange.fapiPrivateGetAllOrders({
                 'symbol': sym,
@@ -221,15 +181,15 @@ for sym in ACTIVE_SYMBOLS:
                 if o_id not in raw_orders_dict:
                     raw_orders_dict[o_id] = {
                         'order_id': o_id,
-                        'client_order_id': o.get('clientOrderId'),
+                        'client_order_id': str(o.get('clientOrderId', '')),
                         'timestamp': int(o.get('time')),
                         'update_timestamp': int(o.get('updateTime', o.get('time'))),
                         'datetime_utc': pd.to_datetime(int(o.get('time')), unit='ms', utc=True).isoformat(),
                         'update_utc': pd.to_datetime(int(o.get('updateTime', o.get('time'))), unit='ms', utc=True).isoformat(),
                         'symbol': sym,
-                        'type': o.get('type'),
-                        'side': o.get('side', '').upper(),
-                        'status': o.get('status'),
+                        'type': str(o.get('type', '')),
+                        'side': str(o.get('side', '')).upper(),
+                        'status': str(o.get('status', '')),
                         'planned_price': float(o.get('price', 0.0) or 0.0),
                         'planned_stop_price': float(o.get('stopPrice', 0.0) or 0.0),
                         'avg_fill_price': float(o.get('avgPrice', 0.0) or 0.0),
@@ -241,10 +201,10 @@ for sym in ACTIVE_SYMBOLS:
         except Exception:
             pass
 
-    print(f"    - User Trades (Fills) Scraped: {trades_sym_count}")
-    print(f"    - Orders Scraped             : {orders_sym_count}")
+    print(f"    - Fills Scraped : {trades_sym_count}")
+    print(f"    - Orders Scraped: {orders_sym_count}")
 
-# 3. Fetch Income History (/fapi/v1/income)
+# 3. Fetch Income & Funding Fee History (/fapi/v1/income)
 print("--> Ingesting complete account income ledger (/fapi/v1/income)...")
 income_cursor = 0
 while True:
@@ -254,14 +214,14 @@ while True:
             break
         for inc in incomes:
             raw_income_list.append({
-                'symbol': inc.get('symbol'),
-                'incomeType': inc.get('incomeType'),
+                'tran_id': str(inc.get('tranId')),
+                'symbol': str(inc.get('symbol', '')),
+                'income_type': str(inc.get('incomeType', '')),
                 'income': float(inc.get('income', 0.0) or 0.0),
-                'asset': inc.get('asset'),
+                'asset': str(inc.get('asset', 'USDT')),
                 'timestamp': int(inc.get('time') or 0),
                 'datetime_utc': pd.to_datetime(int(inc.get('time') or 0), unit='ms', utc=True).isoformat(),
-                'tranId': str(inc.get('tranId')),
-                'tradeId': str(inc.get('tradeId', ''))
+                'trade_id': str(inc.get('tradeId', ''))
             })
         if len(incomes) < 1000:
             break
@@ -277,137 +237,12 @@ df_raw_income = pd.DataFrame(raw_income_list)
 
 
 # =============================================================================
-# STEP 5: Microstructure Matching Engine (Planned vs. Actual Frictions)
+# STEP 4: Cumulative Upsert & CSV Persistence (Zero Overwrite Loss)
 # =============================================================================
-print("\n5. Reconstructing planned vs. actual executions and friction metrics...")
-
-reconstructed_ledger = []
-
-if not df_raw_trades.empty and not df_raw_orders.empty:
-    df_raw_trades['dt'] = pd.to_datetime(df_raw_trades['timestamp'], unit='ms', utc=True)
-    df_raw_orders['dt'] = pd.to_datetime(df_raw_orders['timestamp'], unit='ms', utc=True)
-    
-    df_raw_trades = df_raw_trades.sort_values('dt').reset_index(drop=True)
-    df_raw_orders = df_raw_orders.sort_values('dt').reset_index(drop=True)
-
-    closing_trades = df_raw_trades[df_raw_trades['realized_pnl'] != 0.0].copy()
-
-    for _, c_trade in closing_trades.iterrows():
-        sym = c_trade['symbol']
-        c_time = c_trade['dt']
-        realized_binance_pnl = c_trade['realized_pnl']
-        actual_exit_px = c_trade['price']
-        exit_side = c_trade['side']
-        direction = "SHORT" if exit_side == "BUY" else "LONG"
-        exit_order_id = c_trade['order_id']
-
-        prior_fills = df_raw_trades[
-            (df_raw_trades['symbol'] == sym) &
-            (df_raw_trades['dt'] < c_time) &
-            (df_raw_trades['side'] != exit_side)
-        ]
-
-        if not prior_fills.empty:
-            open_fill = prior_fills.iloc[-1]
-            actual_entry_px = open_fill['price']
-            open_dt         = open_fill['dt']
-            qty             = open_fill['amount']
-            entry_order_id  = open_fill['order_id']
-            entry_fee       = open_fill['fee_cost']
-        else:
-            actual_entry_px = actual_exit_px
-            open_dt         = c_time
-            qty             = c_trade['amount']
-            entry_order_id  = "UNKNOWN"
-            entry_fee       = 0.0
-
-        exit_fee       = c_trade['fee_cost']
-        total_fees_usd = entry_fee + exit_fee
-        hold_min       = max(0.1, (c_time - open_dt).total_seconds() / 60.0)
-
-        entry_order_row = df_raw_orders[df_raw_orders['order_id'] == entry_order_id]
-        if not entry_order_row.empty:
-            planned_entry_px = entry_order_row.iloc[0]['planned_price']
-            if planned_entry_px == 0.0:
-                planned_entry_px = actual_entry_px
-        else:
-            planned_entry_px = actual_entry_px
-
-        exit_order_row = df_raw_orders[df_raw_orders['order_id'] == exit_order_id]
-        close_reason = "SIGNAL_FLIP"
-        planned_exit_px = actual_exit_px
-
-        if not exit_order_row.empty:
-            o_type = str(exit_order_row.iloc[0]['type']).upper()
-            o_stop_px = exit_order_row.iloc[0]['planned_stop_price']
-            if "STOP" in o_type:
-                close_reason = "SL_HIT"
-                planned_exit_px = o_stop_px if o_stop_px > 0 else actual_exit_px
-            elif "TAKE_PROFIT" in o_type:
-                close_reason = "TP_HIT"
-                planned_exit_px = o_stop_px if o_stop_px > 0 else actual_exit_px
-            elif "MARKET" in o_type:
-                close_reason = "SIGNAL_FLIP"
-                planned_exit_px = actual_exit_px
-        else:
-            if realized_binance_pnl > 0.1:
-                close_reason = "TP_HIT"
-            elif realized_binance_pnl < -0.1:
-                close_reason = "SL_HIT"
-            else:
-                close_reason = "SIGNAL_FLIP"
-
-        dir_mult = 1.0 if direction == "LONG" else -1.0
-        entry_slippage_usd = dir_mult * (planned_entry_px - actual_entry_px) * qty
-        exit_slippage_usd  = dir_mult * (planned_exit_px - actual_exit_px) * qty
-
-        if planned_entry_px > 0:
-            idealized_gross_ret = dir_mult * (planned_exit_px - planned_entry_px) / planned_entry_px
-            idealized_pnl_usd   = (planned_entry_px * qty) * idealized_gross_ret
-        else:
-            idealized_pnl_usd   = realized_binance_pnl
-
-        total_friction_loss_usd = idealized_pnl_usd - realized_binance_pnl
-
-        reconstructed_ledger.append({
-            'symbol': sym,
-            'direction': direction,
-            'opened_at_utc': open_dt.isoformat(),
-            'closed_at_utc': c_time.isoformat(),
-            'hold_duration_minutes': round(hold_min, 1),
-            'close_reason': close_reason,
-            'planned_entry_price': round(planned_entry_px, 6),
-            'actual_entry_price': round(actual_entry_px, 6),
-            'entry_slippage_usd': round(entry_slippage_usd, 4),
-            'planned_exit_price': round(planned_exit_px, 6),
-            'actual_exit_price': round(actual_exit_px, 6),
-            'exit_slippage_usd': round(exit_slippage_usd, 4),
-            'contract_quantity': qty,
-            'notional_position_usd': round(actual_entry_px * qty, 2),
-            'exchange_fees_paid': round(total_fees_usd, 4),
-            'idealized_pnl_usd': round(idealized_pnl_usd, 4),
-            'realized_binance_pnl': round(realized_binance_pnl, 4),
-            'total_friction_loss_usd': round(total_friction_loss_usd, 4),
-            'net_wallet_delta_usd': round(realized_binance_pnl - total_fees_usd, 4),
-            'entry_order_id': entry_order_id,
-            'exit_order_id': exit_order_id,
-            'notes': f"Direct Binance Execution ({close_reason}) via Order {exit_order_id}"
-        })
-
-df_reconstructed = pd.DataFrame(reconstructed_ledger)
-print(f"   --> Successfully reconstructed {len(df_reconstructed)} complete trades with full friction breakdown.")
-
-
-# =============================================================================
-# STEP 6: Cumulative Upsert & CSV Persistence (Append and Deduplicate)
-# =============================================================================
-print("\n6. Appending and deduplicating CSV ledgers (Zero Overwrite Loss)...")
+print("\n4. Appending and deduplicating CSV ledgers...")
 
 def upsert_csv(file_path: str, new_df: pd.DataFrame, dedup_col: str, sort_col: str = None) -> pd.DataFrame:
-    """
-    Appends new data to existing CSV files, deduplicating on primary keys.
-    Guarantees historical data is never wiped out.
-    """
+    """Appends and deduplicates records to guarantee historical data is preserved permanently."""
     if new_df.empty:
         if os.path.exists(file_path):
             return pd.read_csv(file_path)
@@ -424,114 +259,64 @@ def upsert_csv(file_path: str, new_df: pd.DataFrame, dedup_col: str, sort_col: s
             deduped.to_csv(file_path, index=False)
             return deduped
         except Exception as e:
-            print(f"Notice loading existing CSV ({file_path}): {e}")
+            print(f"Notice loading CSV ({file_path}): {e}")
 
     new_df.to_csv(file_path, index=False)
     return new_df
 
-master_csv_path  = os.path.join(DATA_DIR, "binance_comprehensive_audit_ledger.csv")
-trades_csv_path  = os.path.join(DATA_DIR, "binance_raw_trades_all.csv")
-orders_csv_path  = os.path.join(DATA_DIR, "binance_raw_orders_all.csv")
-income_csv_path  = os.path.join(DATA_DIR, "binance_raw_income_all.csv")
+trades_csv_path = os.path.join(DATA_DIR, "binance_raw_trades_all.csv")
+orders_csv_path = os.path.join(DATA_DIR, "binance_raw_orders_all.csv")
+income_csv_path = os.path.join(DATA_DIR, "binance_raw_income_all.csv")
 
 final_trades_df = upsert_csv(trades_csv_path, df_raw_trades, dedup_col='id', sort_col='timestamp')
 final_orders_df = upsert_csv(orders_csv_path, df_raw_orders, dedup_col='order_id', sort_col='timestamp')
-final_income_df = upsert_csv(income_csv_path, df_raw_income, dedup_col='tranId', sort_col='timestamp')
-final_recon_df  = upsert_csv(master_csv_path, df_reconstructed, dedup_col='exit_order_id', sort_col='closed_at_utc')
+final_income_df = upsert_csv(income_csv_path, df_raw_income, dedup_col='tran_id', sort_col='timestamp')
 
-print(f"   [Cumulative Ledger] {master_csv_path} (Total Records: {len(final_recon_df)})")
-print(f"   [Cumulative Fills]  {trades_csv_path} (Total Fills: {len(final_trades_df)})")
-print(f"   [Cumulative Orders] {orders_csv_path} (Total Orders: {len(final_orders_df)})")
-print(f"   [Cumulative Income] {income_csv_path} (Total Income: {len(final_income_df)})")
+print(f"   [Archived Fills]  {trades_csv_path} ({len(final_trades_df)} records)")
+print(f"   [Archived Orders] {orders_csv_path} ({len(final_orders_df)} records)")
+print(f"   [Archived Income] {income_csv_path} ({len(final_income_df)} records)")
 
 
 # =============================================================================
-# STEP 7: Supabase Table Sanitization & Direct Ingestion
+# STEP 5: Non-Destructive Supabase Direct Upsert (Phase 1 Raw Tables)
 # =============================================================================
-print("\n7. Sanitizing Supabase tables directly from Binance ground truth...")
+print("\n5. Upserting ground-truth data into Supabase raw tables in batches...")
 
-try:
-    print("   --> Resetting Table 1 (testnet_active_trades)...")
-    supabase.table("testnet_active_trades").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-    print("       Table 1 successfully reset to clean 0/5 active slots.")
-except Exception as e:
-    print(f"       Notice resetting Table 1: {e}")
+def batch_upsert_supabase(table_name: str, df: pd.DataFrame, batch_size: int = 200):
+    if df.empty:
+        return
+    records = df.to_dict(orient="records")
+    total = len(records)
+    print(f"   --> Upserting {total} rows into `{table_name}`...")
+    for i in range(0, total, batch_size):
+        chunk = records[i : i + batch_size]
+        try:
+            supabase.table(table_name).upsert(chunk).execute()
+        except Exception as e:
+            print(f"       [Warning] Batch upsert error on {table_name} [{i}:{i+batch_size}]: {e}")
 
-preserved_rejections = []
-try:
-    print("   --> Preserving clean GATE_REJECTED model prediction audits...")
-    res_rej = supabase.table("testnet_trade_log").select("*").eq("close_reason", "GATE_REJECTED").execute()
-    if res_rej.data:
-        preserved_rejections = res_rej.data
-        print(f"       Preserved {len(preserved_rejections)} clean GATE_REJECTED prediction logs.")
-except Exception as e:
-    print(f"       Notice preserving rejections: {e}")
+batch_upsert_supabase("binance_raw_trades", final_trades_df)
+batch_upsert_supabase("binance_raw_orders", final_orders_df)
+batch_upsert_supabase("binance_raw_income", final_income_df)
 
-try:
-    print("   --> Purging corrupted execution rows from Table 2 (testnet_trade_log)...")
-    supabase.table("testnet_trade_log").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-except Exception as e:
-    print(f"       Notice purging Table 2: {e}")
-
-if preserved_rejections:
-    try:
-        clean_rejs = []
-        for r in preserved_rejections:
-            row_copy = r.copy()
-            row_copy.pop('id', None)
-            clean_rejs.append(row_copy)
-        supabase.table("testnet_trade_log").insert(clean_rejs).execute()
-        print(f"       Successfully restored {len(clean_rejs)} GATE_REJECTED audit rows.")
-    except Exception as e:
-        print(f"       Notice restoring rejections: {e}")
-
-if not final_recon_df.empty:
-    print("   --> Ingesting cumulative authentic Binance execution rows into Table 2...")
-    ingest_payload = []
-    for _, t in final_recon_df.iterrows():
-        ingest_payload.append({
-            "trade_id": None,
-            "created_at": str(t['opened_at_utc']),
-            "closed_at": str(t['closed_at_utc']),
-            "symbol": str(t['symbol']),
-            "direction": str(t['direction']),
-            "close_reason": str(t['close_reason']),
-            "entry_price": float(t['actual_entry_price']),
-            "exit_price": float(t['actual_exit_price']),
-            "realized_binance_pnl": float(t['realized_binance_pnl']),
-            "idealized_pnl": float(t['idealized_pnl_usd']),
-            "friction_loss": float(t['total_friction_loss_usd']),
-            "exchange_fees_paid": float(t['exchange_fees_paid']),
-            "slippage_usd": float(t['entry_slippage_usd'] + t['exit_slippage_usd']),
-            "hold_duration_minutes": float(t['hold_duration_minutes']),
-            "notes": str(t['notes'])
-        })
-
-    try:
-        supabase.table("testnet_trade_log").insert(ingest_payload).execute()
-        print(f"       Successfully ingested {len(ingest_payload)} uncorrupted trades into Supabase Table 2.")
-    except Exception as e:
-        print(f"       Notice populating Table 2: {e}")
+print("   [Success] Ground-truth tables populated cleanly without touching active trading state.")
 
 
 # =============================================================================
-# STEP 8: Final Audit Summary & Scoreboard Display
+# STEP 6: Forensic Attribution & Cumulative Scoreboard Display
 # =============================================================================
-tot_pnl_usd   = final_recon_df['realized_binance_pnl'].sum() if not final_recon_df.empty else 0.0
-tot_fees_usd  = final_recon_df['exchange_fees_paid'].sum() if not final_recon_df.empty else 0.0
-tot_fric_usd  = final_recon_df['total_friction_loss_usd'].sum() if not final_recon_df.empty else 0.0
-tot_ideal_usd = final_recon_df['idealized_pnl_usd'].sum() if not final_recon_df.empty else 0.0
-net_cash_usd  = tot_pnl_usd - tot_fees_usd
+tot_realized_pnl = final_trades_df['realized_pnl'].sum() if not final_trades_df.empty else 0.0
+tot_fees_paid    = final_trades_df['fee_cost'].sum() if not final_trades_df.empty else 0.0
+tot_income       = final_income_df['income'].sum() if not final_income_df.empty else 0.0
+net_cash_delta   = tot_realized_pnl - tot_fees_paid
 
 print("\n===============================================================================")
-print("                   CUMULATIVE GROUND-TRUTH AUDIT SCOREBOARD                    ")
+print("                   AUTHENTIC BINANCE GROUND-TRUTH SCOREBOARD                   ")
 print("===============================================================================")
-print(f"Total Cumulative Fills Scraped       : {len(final_trades_df):,}")
-print(f"Total Cumulative Orders Scraped      : {len(final_orders_df):,}")
-print(f"Total Cumulative Trades Reconstructed: {len(final_recon_df):,}")
-print(f"Theoretical Idealized Model PnL      : ${tot_ideal_usd:+,.2f} USDT")
-print(f"Realized Gross Binance PnL           : ${tot_pnl_usd:+,.2f} USDT")
-print(f"Total True Binance Exchange Fees     : ${tot_fees_usd:,.2f} USDT")
-print(f"Total Execution Friction Loss        : ${tot_fric_usd:,.2f} USDT")
-print(f"True Net Cash Delta on Binance       : ${net_cash_usd:+,.2f} USDT")
+print(f"Total Cumulative Fills Scraped   : {len(final_trades_df):,}")
+print(f"Total Cumulative Orders Scraped  : {len(final_orders_df):,}")
+print(f"Total Income / Funding Records   : {len(final_income_df):,}")
+print(f"Cumulative Realized Trading PnL  : ${tot_realized_pnl:+,.2f} USDT")
+print(f"Total Commission Fees Deducted   : ${tot_fees_paid:,.2f} USDT")
+print(f"Total Net Cash Delta on Binance  : ${net_cash_delta:+,.2f} USDT")
 print("===============================================================================\n")

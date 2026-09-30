@@ -1,39 +1,33 @@
 """
 ====================================================================================================
-ALGORITHM: src/features.py — Real-Time Signal Detection & Complete Feature Engineering Engine
+ALGORITHM: src/features.py — True Rolling Sequence & Multi-Timeframe Feature Pipeline
 ====================================================================================================
 Purpose:
-  Connect to Binance Futures Testnet via CCXT, fetch multi-timeframe market data (15m, 4h, 1d),
-  evaluate active 9/15 EMA crossovers on the freshly completed candle (preserving the foundational
-  -1 and -2 index logic), and compute the complete Master Union of technical indicators matching
-  Section A.7. Guarantees that all engineered interaction features (including `FE_full_htf_align_long`,
-  `FE_full_htf_align_short`, `FE_adx_x_volume`, etc.) are computed in production, permanently
-  preventing model KeyError exceptions upon retraining.
+  Connects to Binance Futures via CCXT, fetches multi-timeframe OHLCV data with adequate warmup,
+  detects 9/15 EMA crossovers on immutable closed candles (-1 vs -2), and computes the Section A.7
+  feature suite. Generates authentic rolling 15-bar sequence histories for Funnel GRU inference,
+  permanently resolving the temporal flattening bug.
 
 Algorithm Steps:
-  Step 1: Execution Guard, Library Ingestion & Safe Math:
-          - Import numpy, pandas, torch, ta, ccxt. Define safe_ratio to guard against div-by-zero.
-  Step 2: Multi-Timeframe Ingestion & Incomplete Bar Trimming (The -1 and -2 Fix):
-          - Discard forming candle via raw_df.iloc[:-1] so index -1 is strictly completed.
+  Step 1: Module Setup, Safe Math Utilities & Library Ingestion:
+          - Safe ratio division to prevent NaN/Inf outputs in ratio features.
+  Step 2: Multi-Timeframe Ingestion with Expanded Warmup Limits:
+          - Ingest 100 bars (15m), 60 bars (4h), 50 bars (1d).
+          - Drop forming candle `[:-1]` to ensure index -1 is closed and immutable.
   Step 3: Crossover Detection Engine (`detect_crossover`):
-          - Compute 9 EMA and 15 EMA on closed 15m bars.
-          - Evaluate bullish/bearish crossover strictly on index -1 vs index -2.
-  Step 4: Vectorized Indicator Calculator (Complete Section A.7 Feature Parity):
-          - Calculate base indicators across 15m, 4h, and 1d.
-          - Calculate complete suite of Section A.7 engineered interaction features (FE_ prefix):
-            FE_full_htf_align_long, FE_full_htf_align_short, FE_adx_trending, FE_high_volume,
-            session flags, ratios, and cross-timeframe biases.
-  Step 5: Model Input Formatting Pipeline (`ProductionFeaturePipeline`):
-          - Ingest feature manifest, extract target-specific 16 SHAP features, and apply pre-fitted
-            production scaler parameters (mean mu, scale sigma).
-          - Format 2D array for CatBoost and 3D causal sequence tensor for Funnel GRU.
-  Step 6: Integration Self-Test Probe (`if __name__ == '__main__'`).
+          - Compute 9 EMA and 15 EMA strictly on index -1 vs index -2.
+  Step 4: Vectorized Indicator Calculator (`compute_production_features`):
+          - Calculate 15m LTF indicators, 4h HTF indicators, 1d Daily indicators.
+          - Compute full suite of Section A.7 interaction features (FE_ prefix).
+  Step 5: True Rolling Sequence Extractor (`extract_rolling_features_history`):
+          - Iterates across the last `seq_len` closed bars to construct a genuine temporal history.
+  Step 6: Production Model Pipeline (`ProductionFeaturePipeline`):
+          - Normalizes CatBoost (1, 16) array and Funnel GRU (1, seq_len, 16) causal tensor
+            using pre-fitted production scaler parameters (mu, sigma) from the manifest.
+  Step 7: Production Self-Test Probe (`if __name__ == '__main__'`).
 ====================================================================================================
 """
 
-# =============================================================================
-# STEP 1: Execution Guard, Library Ingestion & Safe Math
-# =============================================================================
 import os
 import json
 import math
@@ -41,23 +35,15 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import torch
+import ta
+import ccxt
 
-try:
-    import ta
-except ImportError:
-    import subprocess
-    subprocess.run(["pip", "install", "-q", "ta"], check=True)
-    import ta
 
-try:
-    import ccxt
-except ImportError:
-    import subprocess
-    subprocess.run(["pip", "install", "-q", "ccxt"], check=True)
-    import ccxt
-
+# =============================================================================
+# STEP 1: Safe Math Utilities
+# =============================================================================
 def safe_ratio(num, den):
-    """Prevents division by zero or infinite outputs in ratio calculations."""
+    """Prevents division by zero or infinite outputs in financial ratio calculations."""
     try:
         den_clean = np.where(den == 0, np.nan, den)
         res = num / den_clean
@@ -68,12 +54,13 @@ def safe_ratio(num, den):
 
 
 # =============================================================================
-# STEP 2: Multi-Timeframe Ingestion & Incomplete Bar Trimming
+# STEP 2: Multi-Timeframe Ingestion with Expanded Warmup
 # =============================================================================
 def fetch_closed_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
     """
-    Fetches raw OHLCV candles from Binance and DISCARDS the active, forming candle.
+    Fetches raw OHLCV candles from Binance and drops the active, forming candle.
     Guarantees that .iloc[-1] is immutable and closed; .iloc[-2] is the prior closed candle.
+    Default limit of 100 ensures complete mathematical warmup for 15-span and 26-span indicators.
     """
     raw_bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(raw_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -85,7 +72,7 @@ def fetch_closed_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100) 
 
 
 # =============================================================================
-# STEP 3: Crossover Detection Engine (Foundational -1 and -2 Logic)
+# STEP 3: Crossover Detection Engine
 # =============================================================================
 def detect_crossover(df_15m_closed: pd.DataFrame):
     """
@@ -118,14 +105,13 @@ def detect_crossover(df_15m_closed: pd.DataFrame):
 
 
 # =============================================================================
-# STEP 4: Vectorized Feature Math (Complete Section A.7 Feature Suite)
+# STEP 4: Vectorized Indicator Calculator (Section A.7 Feature Parity)
 # =============================================================================
-def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d: pd.DataFrame) -> dict:
+def compute_production_features_at_idx(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d: pd.DataFrame, idx: int = -1) -> dict:
     """
-    Computes the complete Section A.7 feature suite required by all retrained production
-    models directly from closed OHLCV data across 15m, 4h, and 1d.
+    Computes Section A.7 features at a specific candle index `idx` (default -1 = latest closed).
     """
-    # ── 1. 15m Low-Timeframe Indicators ──
+    # ── 1. 15m Indicators ──
     c_15m = df_15m['close']
     h_15m = df_15m['high']
     l_15m = df_15m['low']
@@ -134,11 +120,11 @@ def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d
     ema_fast_15m_s = c_15m.ewm(span=9, adjust=False).mean()
     ema_slow_15m_s = c_15m.ewm(span=15, adjust=False).mean()
     
-    ema_fast_ltf   = float(ema_fast_15m_s.iloc[-1])
-    ema_slow_ltf   = float(ema_slow_15m_s.iloc[-1])
-    ema_fast_prev  = float(ema_fast_15m_s.iloc[-2])
-    ema_slow_prev  = float(ema_slow_15m_s.iloc[-2])
-    price_latest   = float(c_15m.iloc[-1])
+    ema_fast_ltf   = float(ema_fast_15m_s.iloc[idx])
+    ema_slow_ltf   = float(ema_slow_15m_s.iloc[idx])
+    ema_fast_prev  = float(ema_fast_15m_s.iloc[idx - 1])
+    ema_slow_prev  = float(ema_slow_15m_s.iloc[idx - 1])
+    price_latest   = float(c_15m.iloc[idx])
 
     ema_fast_slope = safe_ratio((ema_fast_ltf - ema_fast_prev), ema_fast_prev) * 100.0
     ema_slow_slope = safe_ratio((ema_slow_ltf - ema_slow_prev), ema_slow_prev) * 100.0
@@ -146,31 +132,32 @@ def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d
 
     adx_ind_15m = ta.trend.ADXIndicator(high=h_15m, low=l_15m, close=c_15m, window=14, fillna=True)
     adx_15m_s   = adx_ind_15m.adx()
-    adx_ltf     = float(adx_15m_s.iloc[-1])
-    adx_slope   = float(adx_15m_s.iloc[-1] - adx_15m_s.iloc[-2])
+    adx_ltf     = float(adx_15m_s.iloc[idx])
+    adx_slope   = float(adx_15m_s.iloc[idx] - adx_15m_s.iloc[idx - 1])
 
     rsi_15m_s = ta.momentum.RSIIndicator(close=c_15m, window=14, fillna=True).rsi()
-    rsi_ltf   = float(rsi_15m_s.iloc[-1])
+    rsi_ltf   = float(rsi_15m_s.iloc[idx])
 
     atr_15m_s = ta.volatility.AverageTrueRange(high=h_15m, low=l_15m, close=c_15m, window=14, fillna=True).average_true_range()
-    atr_ltf   = float(atr_15m_s.iloc[-1])
+    atr_ltf   = float(atr_15m_s.iloc[idx])
     atr_pct   = (atr_ltf / price_latest * 100.0) if price_latest > 0 else 0.0
     price_to_atr = safe_ratio(price_latest, atr_ltf)
 
     bb_ind = ta.volatility.BollingerBands(close=c_15m, window=20, window_dev=2, fillna=True)
-    bb_width_ltf = float(bb_ind.bollinger_wband().iloc[-1])
+    bb_width_ltf = float(bb_ind.bollinger_wband().iloc[idx])
 
     macd_15m_diff = ta.trend.MACD(close=c_15m, window_fast=12, window_slow=26, window_sign=9, fillna=True).macd_diff()
-    macd_histogram_ltf = float(macd_15m_diff.iloc[-1])
+    macd_histogram_ltf = float(macd_15m_diff.iloc[idx])
 
     vol_ma_s     = v_15m.rolling(window=20, min_periods=1).mean()
-    volume_ratio = safe_ratio(float(v_15m.iloc[-1]), float(vol_ma_s.iloc[-1]))
-    volume_trend = safe_ratio((float(vol_ma_s.iloc[-1]) - float(vol_ma_s.iloc[-2])), float(vol_ma_s.iloc[-2])) * 100.0
+    volume_ratio = safe_ratio(float(v_15m.iloc[idx]), float(vol_ma_s.iloc[idx]))
+    volume_trend = safe_ratio((float(vol_ma_s.iloc[idx]) - float(vol_ma_s.iloc[idx - 1])), float(vol_ma_s.iloc[idx - 1])) * 100.0
 
-    swing_high = float(h_15m.iloc[-20:].max())
-    swing_low  = float(l_15m.iloc[-20:].min())
+    swing_window = df_15m.iloc[max(0, len(df_15m) + idx - 19) : len(df_15m) + idx + 1]
+    swing_high = float(swing_window['high'].max())
+    swing_low  = float(swing_window['low'].min())
 
-    # ── 2. 4h High-Timeframe Indicators ──
+    # ── 2. 4h Indicators ──
     c_4h = df_4h['close']
     h_4h = df_4h['high']
     l_4h = df_4h['low']
@@ -186,58 +173,53 @@ def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d
     rsi_4h = float(ta.momentum.RSIIndicator(close=c_4h, window=14, fillna=True).rsi().iloc[-1])
     macd_histogram_4h = float(ta.trend.MACD(close=c_4h, window_fast=12, window_slow=26, window_sign=9, fillna=True).macd_diff().iloc[-1])
 
-    # ── 3. 1d Daily Timeframe Indicators ──
+    # ── 3. 1d Indicators ──
     c_1d = df_1d['close']
     ema_fast_1d = float(c_1d.ewm(span=9, adjust=False).mean().iloc[-1])
     ema_slow_1d = float(c_1d.ewm(span=15, adjust=False).mean().iloc[-1])
     htf_1d_bias = 1.0 if ema_fast_1d > ema_slow_1d else -1.0
 
     # ── 4. Temporal Context ──
-    last_candle_time = df_15m['datetime_utc'].iloc[-1]
-    hour_of_day = int(last_candle_time.hour)
-    day_of_week = int(last_candle_time.weekday())
+    target_time = df_15m['datetime_utc'].iloc[idx]
+    hour_of_day = int(target_time.hour)
+    day_of_week = int(target_time.weekday())
 
-    # ── 5. Complete Section A.7 Engineered Features (FE_) ──
-    fe_rsi_mtf_ratio          = safe_ratio(rsi_ltf, rsi_4h)
-    fe_ema_ratio              = safe_ratio(ema_fast_ltf, ema_slow_ltf)
-    fe_price_to_bb            = safe_ratio(atr_pct, bb_width_ltf)
-    fe_adx_4h_ratio           = safe_ratio(adx_ltf, adx_4h)
-    fe_vol_efficiency_ratio   = safe_ratio(volume_ratio, atr_pct)
-    fe_spread_to_atr_ratio    = safe_ratio((price_latest - ema_fast_ltf), atr_ltf)
+    # ── 5. Section A.7 Interactions ──
+    fe_rsi_mtf_ratio        = safe_ratio(rsi_ltf, rsi_4h)
+    fe_ema_ratio            = safe_ratio(ema_fast_ltf, ema_slow_ltf)
+    fe_price_to_bb          = safe_ratio(atr_pct, bb_width_ltf)
+    fe_adx_4h_ratio         = safe_ratio(adx_ltf, adx_4h)
+    fe_vol_efficiency_ratio = safe_ratio(volume_ratio, atr_pct)
+    fe_spread_to_atr_ratio  = safe_ratio((price_latest - ema_fast_ltf), atr_ltf)
     
-    fe_macd_x_volume          = macd_histogram_ltf * volume_ratio
-    fe_adx_x_volume           = adx_ltf * volume_ratio
-    fe_ema_sep_x_adx          = ema_separation * adx_ltf
-    fe_adx_x_atr_pct          = adx_ltf * (atr_ltf / price_latest if price_latest > 0 else 0.0)
-    fe_exhaustion_risk        = (1 if rsi_ltf > 70.0 else 0) * ema_separation
+    fe_macd_x_volume        = macd_histogram_ltf * volume_ratio
+    fe_adx_x_volume         = adx_ltf * volume_ratio
+    fe_ema_sep_x_adx        = ema_separation * adx_ltf
+    fe_adx_x_atr_pct        = adx_ltf * (atr_ltf / price_latest if price_latest > 0 else 0.0)
+    fe_exhaustion_risk      = (1 if rsi_ltf > 70.0 else 0) * ema_separation
 
-    fe_rsi_x_htf4h            = rsi_ltf * htf_4h_bias
-    fe_rsi4h_x_htf1d          = rsi_4h * htf_1d_bias
-    fe_adx_x_htf1d            = adx_ltf * htf_1d_bias
+    fe_rsi_x_htf4h          = rsi_ltf * htf_4h_bias
+    fe_rsi4h_x_htf1d        = rsi_4h * htf_1d_bias
+    fe_adx_x_htf1d          = adx_ltf * htf_1d_bias
 
-    # Macro Alignments
-    fe_full_htf_align_long    = 1 if (htf_4h_bias == 1.0 and htf_1d_bias == 1.0) else 0
-    fe_full_htf_align_short   = 1 if (htf_4h_bias == -1.0 and htf_1d_bias == -1.0) else 0
+    fe_full_htf_align_long  = 1 if (htf_4h_bias == 1.0 and htf_1d_bias == 1.0) else 0
+    fe_full_htf_align_short = 1 if (htf_4h_bias == -1.0 and htf_1d_bias == -1.0) else 0
 
-    # Regimes & Thresholds
-    fe_adx_trending           = 1 if adx_ltf > 25.0 else 0
-    fe_adx_4h_trending        = 1 if adx_4h > 25.0 else 0
-    fe_rsi_overbought         = 1 if rsi_ltf > 65.0 else 0
-    fe_rsi_oversold           = 1 if rsi_ltf < 35.0 else 0
-    fe_rsi_4h_bull            = 1 if rsi_4h > 55.0 else 0
-    fe_high_volume            = 1 if volume_ratio > 1.5 else 0
-    fe_bb_squeeze_regime      = 1 if bb_width_ltf < atr_ltf else 0
+    fe_adx_trending         = 1 if adx_ltf > 25.0 else 0
+    fe_adx_4h_trending      = 1 if adx_4h > 25.0 else 0
+    fe_rsi_overbought       = 1 if rsi_ltf > 65.0 else 0
+    fe_rsi_oversold         = 1 if rsi_ltf < 35.0 else 0
+    fe_rsi_4h_bull          = 1 if rsi_4h > 55.0 else 0
+    fe_high_volume          = 1 if volume_ratio > 1.5 else 0
+    fe_bb_squeeze_regime    = 1 if bb_width_ltf < atr_ltf else 0
 
-    # Sessions
-    fe_session_london         = 1 if hour_of_day in [7, 8, 9, 10, 11, 12, 13, 14, 15, 16] else 0
-    fe_session_ny             = 1 if hour_of_day in [13, 14, 15, 16, 17, 18, 19, 20, 21] else 0
-    fe_session_asia           = 1 if hour_of_day in [23, 0, 1, 2, 3, 4, 5, 6, 7, 8] else 0
-    fe_session_overlap        = 1 if hour_of_day in [13, 14, 15] else 0
-    fe_weekend                = 1 if day_of_week in [5, 6] else 0
+    fe_session_london       = 1 if hour_of_day in [7, 8, 9, 10, 11, 12, 13, 14, 15, 16] else 0
+    fe_session_ny           = 1 if hour_of_day in [13, 14, 15, 16, 17, 18, 19, 20, 21] else 0
+    fe_session_asia         = 1 if hour_of_day in [23, 0, 1, 2, 3, 4, 5, 6, 7, 8] else 0
+    fe_session_overlap      = 1 if hour_of_day in [13, 14, 15] else 0
+    fe_weekend              = 1 if day_of_week in [5, 6] else 0
 
-    # ── 6. Assemble Full Master Union Dictionary ──
     features_dict = {
-        # Section A.7 Primary & Interaction Features
         'FE_adx_4h_ratio':           round(float(fe_adx_4h_ratio), 4),
         'FE_adx_4h_trending':        int(fe_adx_4h_trending),
         'FE_adx_trending':           int(fe_adx_trending),
@@ -266,8 +248,6 @@ def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d
         'FE_spread_to_atr_ratio':    round(float(fe_spread_to_atr_ratio), 4),
         'FE_vol_efficiency_ratio':   round(float(fe_vol_efficiency_ratio), 4),
         'FE_weekend':                int(fe_weekend),
-
-        # Base Indicators
         'adx_4h':                    round(float(adx_4h), 2),
         'adx_ltf':                   round(float(adx_ltf), 2),
         'adx_slope':                 round(float(adx_slope), 2),
@@ -295,7 +275,6 @@ def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d
         'volume_trend':              round(float(volume_trend), 4)
     }
 
-    # Clean any accidental NaNs or infinite values
     for k, v in features_dict.items():
         if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
             features_dict[k] = 0.0
@@ -303,18 +282,42 @@ def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d
     return features_dict
 
 
+def compute_production_features(df_15m: pd.DataFrame, df_4h: pd.DataFrame, df_1d: pd.DataFrame) -> dict:
+    """Wrapper computing features on the most recent finalized closed bar (index -1)."""
+    return compute_production_features_at_idx(df_15m, df_4h, df_1d, idx=-1)
+
+
 # =============================================================================
-# STEP 5: Model Input Formatting Pipeline
+# STEP 5: True Rolling Sequence Extractor
+# =============================================================================
+def extract_rolling_features_history(
+    df_15m: pd.DataFrame,
+    df_4h: pd.DataFrame,
+    df_1d: pd.DataFrame,
+    seq_len: int = 15
+) -> list:
+    """
+    Extracts a genuine rolling sequential history of `seq_len` completed candles.
+    Eliminates the temporal flattening bug by providing authentic trajectory dynamics to the GRU.
+    """
+    history = []
+    start_idx = -seq_len
+    for i in range(start_idx, 0):
+        feat = compute_production_features_at_idx(df_15m, df_4h, df_1d, idx=i)
+        history.append(feat)
+    return history
+
+
+# =============================================================================
+# STEP 6: Production Model Pipeline
 # =============================================================================
 class ProductionFeaturePipeline:
     def __init__(self, manifest_path: str = None):
         if manifest_path is None:
             manifest_path = os.path.join(os.getcwd(), "Optimal_hyperparameters", "Ema_testnet_feature_manifest.json")
             if not os.path.exists(manifest_path):
-                manifest_path = os.path.join(os.getcwd(), "Ema_testnet", "Optimal_hyperparameters", "Ema_testnet_feature_manifest.json")
-            if not os.path.exists(manifest_path):
                 manifest_path = os.path.join(os.getcwd(), "ema_testnet", "Optimal_hyperparameters", "Ema_testnet_feature_manifest.json")
-            
+
         if not os.path.exists(manifest_path):
             raise FileNotFoundError(f"[FATAL] Feature manifest not found at: {manifest_path}")
 
@@ -331,20 +334,15 @@ class ProductionFeaturePipeline:
         key = f"{target}__{direction}__{symbol}"
         if key not in self.scalers:
             raise KeyError(f"[Feature Error] No production scaler registered for: {key}")
-        
         entry = self.scalers[key]
         return np.array(entry["mean"], dtype=np.float32), np.array(entry["scale"], dtype=np.float32)
 
     def prepare_catboost_input(self, features_dict: dict, target: str, direction: str, symbol: str) -> np.ndarray:
+        """Constructs normalized (1, 16) array for CatBoost."""
         f_names = self.get_feature_names(target, direction)
         mean_arr, scale_arr = self.get_scaler_params(target, direction, symbol)
 
-        raw_vals = []
-        for col in f_names:
-            if col not in features_dict:
-                raise KeyError(f"[Feature Pipeline Error] Manifest requires '{col}' which is missing from features dictionary!")
-            raw_vals.append(features_dict[col])
-
+        raw_vals = [features_dict[col] for col in f_names]
         raw_arr = np.array(raw_vals, dtype=np.float32)
         scaled_vals = (raw_arr - mean_arr) / np.where(scale_arr == 0, 1.0, scale_arr)
         return scaled_vals.reshape(1, -1)
@@ -358,6 +356,7 @@ class ProductionFeaturePipeline:
         seq_len: int = 15,
         device: torch.device = torch.device('cpu')
     ) -> torch.Tensor:
+        """Constructs normalized (1, seq_len, 16) tensor for Funnel GRU forward pass."""
         target_cont = 'target_profit_v1' if 'profit' in target_cls else 'target_danger_v1'
         f_names = self.get_feature_names(target_cont, direction)
         mean_arr, scale_arr = self.get_scaler_params(target_cont, direction, symbol)
@@ -374,14 +373,11 @@ class ProductionFeaturePipeline:
 
 
 # =============================================================================
-# STEP 6: Module Integration Self-Test Probe
+# STEP 7: Integration Self-Test Probe
 # =============================================================================
-RUN_FEATURES_SELF_TEST = True
-
-if __name__ == "__main__" and RUN_FEATURES_SELF_TEST:
+if __name__ == "__main__":
     print("===============================================================================")
-    print("  TESTING COMPLETE SECTION A.7 PRODUCTION FEATURE PIPELINE                     ")
+    print("  TESTING ROLLING SEQUENCE FEATURE PIPELINE (src/features.py)                  ")
     print("===============================================================================")
     pipeline = ProductionFeaturePipeline()
-    print("  Feature pipeline initialized successfully from manifest.")
-    print("===============================================================================")
+    print("  [PASS] Feature manifest and scalers loaded cleanly.")

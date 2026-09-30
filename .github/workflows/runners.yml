@@ -1,18 +1,29 @@
 # ====================================================================================================
-# ALGORITHM: .github/workflows/runner.yml — Continuous Production Daemon with GH_PAT Dispatch
+# ALGORITHM: .github/workflows/runners.yml — Production Daemon with 350m Cap & Pip Caching
 # ====================================================================================================
 # Purpose:
-#   Runs the 5.5-hour autonomous trading daemon on GitHub Actions. Exposes the Personal Access Token
-#   (GH_PAT) to authorize workflow dispatch calls for self-chaining, tunnels traffic through the
-#   German proxy secret (BINANCE_PROXY_URL), and ensures zero-downtime 24/7 cloud execution.
+#   Continuous cloud production orchestrator for the EMA-testnet Pure Market FSM desk.
+#   Executes `main.py` in an isolated GitHub Actions Ubuntu container, tunnels traffic through the
+#   Frankfurt proxy tunnel, enforces a hard 350-minute job timeout, leverages pip caching for sub-10s
+#   dependency installation, and authorizes self-chaining successor dispatches via GH_PAT.
 #
 # Algorithm Steps:
-#   Step 1: Workflow Triggers: Manual dispatch & 6-hour cron failsafe.
-#   Step 2: Concurrency Lock: Ensures only one active trading worker runs per repository.
-#   Step 3: Repository Checkout: Pulls fresh code from the 'main' branch via actions/checkout@v4.
-#   Step 4: Python Runtime Setup: Installs Python 3.12 via actions/setup-python@v5.
-#   Step 5: Dependency Installation: Installs pinned requirements including pysocks.
-#   Step 6: Daemon Launch: Injects GH_PAT, proxy URL, Binance keys, and Supabase credentials into main.py.
+#   Step 1: Workflow Triggers:
+#           - Manual execution via `workflow_dispatch`.
+#           - Emergency 8-hour dead-man's watchdog schedule (`0 */8 * * *`) to auto-revive if self-chaining fails.
+#   Step 2: Concurrency Lock (`binance-testnet-worker`):
+#           - Enforces strictly 1 active trading worker per repository (`cancel-in-progress: false`).
+#   Step 3: Job Configuration & Timeout Guard:
+#           - Runs on ubuntu-latest with `timeout-minutes: 350` to backstop the 320-minute software handover.
+#           - Grants `actions: write` and `contents: write` permissions for GH_PAT workflow dispatch.
+#   Step 4: Repository Checkout & Python 3.12 Setup:
+#           - Checks out `main` branch via actions/checkout@v4.
+#           - Configures Python 3.12 with pip caching (`cache: 'pip'`) to slash startup overhead.
+#   Step 5: Production Dependency Ingestion:
+#           - Installs pinned requirements (CatBoost, PyTorch, CCXT, Supabase, TA).
+#   Step 6: Master Daemon Launch:
+#           - Injects GH_PAT, proxy URL, Binance API keys, and Supabase credentials.
+#           - Launches `main.py` with output unbuffering (`python -u`).
 # ====================================================================================================
 
 name: EMA Testnet Production Daemon
@@ -20,7 +31,8 @@ name: EMA Testnet Production Daemon
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    # 8-Hour emergency watchdog (Resurrects bot only if self-chaining fails; avoids 40m queue collisions)
+    - cron: '0 */8 * * *'
 
 concurrency:
   group: binance-testnet-worker
@@ -29,28 +41,30 @@ concurrency:
 jobs:
   run-trader:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     permissions:
       contents: write
       actions: write
 
     steps:
-      # Step 3: Repository Checkout
+      # Step 4: Repository Checkout
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Step 4: Setup Python 3.12 Runtime
-      - name: Set up Python 3.12
+      # Step 4: Setup Python 3.12 Runtime with Pip Wheel Caching
+      - name: Set up Python 3.12 with Pip Cache
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
-      # Step 5: Install Production Dependencies
-      - name: Install Dependencies
+      # Step 5: Install Production Dependencies (Cached)
+      - name: Install Production Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Step 6: Launch Daemon with GH_PAT and Proxy Injection
+      # Step 6: Launch Master Orchestrator Daemon
       - name: Run 5.5-Hour Self-Chaining Trading Engine
         env:
           PYTHONUNBUFFERED: "1"

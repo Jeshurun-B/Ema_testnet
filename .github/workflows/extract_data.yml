@@ -1,20 +1,30 @@
 # ====================================================================================================
-# ALGORITHM: .github/workflows/extract_data.yml — Manual Binance Extraction & Git Commit Workflow
+# ALGORITHM: .github/workflows/extract_data.yml — Read-Only Mirror & Git Rebase Commit Workflow
 # ====================================================================================================
 # Purpose:
-#   Manual one-shot GitHub Actions workflow that executes `src/extract_binance_ground_truth.py`.
-#   Scrapes the 3 Binance Futures API ledgers through the Frankfurt proxy, resets Supabase Table 1,
-#   repopulates Table 2 directly from the exchange API, and commits the extracted CSV artifacts
-#   directly back to the repository's `main` branch under `data/ground_truth/`.
+#   Manual on-demand workflow that executes `src/extract_binance_ground_truth.py`.
+#   Scrapes 56 days of Binance matching engine history (fills, orders, income) in a strictly
+#   READ-ONLY mode through the Frankfurt proxy, batch-upserts directly into dedicated Supabase raw
+#   tables (`binance_raw_trades`, `binance_raw_orders`, `binance_raw_income`), and commits
+#   deduplicated CSV artifacts back to `main` with rebase collision protection.
 #
 # Algorithm Steps:
-#   Step 1: Workflow Triggers: Manual execution via workflow_dispatch.
-#   Step 2: Concurrency & Permissions: Sets write permissions for repository commits.
-#   Step 3: Repository Checkout: Pulls source code via actions/checkout@v4.
-#   Step 4: Python Runtime Setup: Configures Python 3.12 via actions/setup-python@v5.
-#   Step 5: Dependency Installation: Upgrades pip and installs requirements.txt (including pysocks).
-#   Step 6: Execute Extraction Script: Injects Binance, proxy, and Supabase credentials.
-#   Step 7: Commit & Push Ground-Truth CSVs: Commits data/ground_truth/*.csv back to origin/main.
+#   Step 1: Workflow Triggers: Manual execution via `workflow_dispatch`.
+#   Step 2: Concurrency Lock (`binance-data-extraction`):
+#           - Guarantees only one extraction job executes at any given time.
+#   Step 3: Job Configuration:
+#           - Runs on ubuntu-latest with `timeout-minutes: 60` and `contents: write` permissions.
+#   Step 4: Repository Checkout & Python 3.12 Setup:
+#           - Checks out `main` branch via actions/checkout@v4.
+#           - Configures Python 3.12 with pip caching (`cache: 'pip'`).
+#   Step 5: Production Dependency Ingestion:
+#           - Installs pip dependencies from cache.
+#   Step 6: Execute Read-Only Ground-Truth Mirror:
+#           - Injects proxy tunnel and credentials; executes `extract_binance_ground_truth.py`.
+#   Step 7: Commit & Push Ground-Truth CSVs with Rebase Guard:
+#           - Stages `data/ground_truth/*.csv`.
+#           - Pulls with rebase (`git pull --rebase origin main`) before pushing to eliminate
+#             non-fast-forward push rejections.
 # ====================================================================================================
 
 name: Extract Binance Ground Truth History
@@ -29,28 +39,30 @@ concurrency:
 jobs:
   extract-and-sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
 
     steps:
-      # Step 3: Repository Checkout
+      # Step 4: Repository Checkout
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Step 4: Python Runtime Setup
-      - name: Set up Python 3.12
+      # Step 4: Setup Python 3.12 Runtime with Pip Cache
+      - name: Set up Python 3.12 with Pip Cache
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
-      # Step 5: Install Production Dependencies
+      # Step 5: Install Dependencies (Cached)
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Step 6: Execute Direct API Extraction and Supabase Sync
-      - name: Extract Binance Ground Truth and Overwrite Supabase
+      # Step 6: Execute Read-Only Binance Extraction & Supabase Raw Upsert
+      - name: Extract Binance Ground Truth to Supabase Raw Tables
         env:
           PYTHONUNBUFFERED: "1"
           BINANCE_PROXY_URL: ${{ secrets.BINANCE_PROXY_URL }}
@@ -61,7 +73,7 @@ jobs:
         run: |
           python -u src/extract_binance_ground_truth.py
 
-      # Step 7: Commit & Push Extracted CSV Ledgers Back to Repository
+      # Step 7: Commit & Push Extracted CSV Ledgers Back to Repository (with Rebase Guard)
       - name: Commit and Push Ground-Truth CSVs
         run: |
           git config --global user.name "GitHub Actions Automation"
@@ -71,5 +83,6 @@ jobs:
             echo "No new ground-truth CSV changes to commit."
           else
             git commit -m "data(ground_truth): sync authentic Binance API trade, order, and income ledgers"
+            git pull --rebase origin main
             git push origin main
           fi

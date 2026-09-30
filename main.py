@@ -1,32 +1,40 @@
 r"""
 ====================================================================================================
-ALGORITHM: main.py — Version 2.0 Thin Production Daemon with Experimental A/B Monitoring
+ALGORITHM: main.py — Version 3.0 Pure Market-Execution FSM Orchestrator (2-Speed Architecture)
 ====================================================================================================
 Purpose:
-  Institutional 5.5-hour continuous trading engine. Operates with In-Memory State as the primary
-  source of truth during runtime (Hot Path). Executes immediate Market (Taker) entries on Binance
-  with zero limit order timeouts. Partitions crossovers into MAIN TRADES (standard capital) and
-  CONTROL TRADES (fixed $50 micro-notional floor). Logs 100% of crossover events to Supabase
-  Table 3 (`crossover_telemetry_stream`), sweeps ghost orders on boot, and chains via `runners.yml`.
+  Institutional continuous trading daemon engineered exclusively for GitHub Actions CI/CD runners.
+  Enforces the Pure Market-Execution FSM across 5 assets (BTC, ETH, SOL, DOGE, XRP):
+    - Zero Conditional Orders: Never deploys resting TP or SL limit orders on the exchange.
+    - 2.0-Second Fast Heartbeat: Synthetic barrier vigilance using a single 1-weight Mark Price call.
+    - 15-Minute Slow Pipeline: Evaluates closed candles, runs ML inference, and routes market orders.
+    - Cold-Start RAM Hydration: Single database read on startup; zero database reads during runtime.
+    - Autonomous Self-Chaining: Dispatches successor workflow at minute 320 via GH_PAT (HTTP 204).
 
 Algorithm Steps:
-  Step 1: Module Setup, Dynamic Price Formatter & Output Unbuffering.
-  Step 2: In-Memory Engine Initialization & Startup Sweeper:
-          - Purges all unlinked ghost orders on Binance on startup via `purge_unlinked_ghost_orders`.
-          - Hydrates active trades from Table 1.
-  Step 3: Self-Chaining Dispatcher (Targeting runners.yml via GH_PAT).
-  Step 4: Silent In-Memory Position Maintenance (Every 10s):
-          - Inspects Binance positions directly; when a position terminates, reconciles fill price
-            from bracket orders and logs to Table 2, setting the symbol flat to wait for the next cross.
-  Step 5: 15-Minute Pipeline (100% Crossover Telemetry & Market Order Execution):
-          - Ingests closed bars across 15m, 4h, 1d.
-          - Rejects duplicate completed bars via `last_evaluated_candles`.
-          - If a crossover fires on an active coin: strict reversal assertion -> liquidates immediately.
-          - Computes 25 features + 15m ATR %. Runs RAM model inference.
-          - Evaluates Gates (Dynamic Soft-Gate + ATR Clamp) -> assigns MAIN vs. CONTROL tier.
-          - Emits 100% raw telemetry record to Table 3 (`crossover_telemetry_stream`).
-          - Executes immediate Market Entry order on Binance for the symbol.
-  Step 6: Master Phase-Locked Loop (Target: Exact :05.00 Close).
+  Step 1: Module Setup, GitHub Actions Output Unbuffering & Environment Ingestion:
+          - Extract GH_PAT, GITHUB_REPOSITORY, and Binance credentials.
+  Step 2: Engine Initialization & Single-Read Cold-Start Hydration:
+          - Initialize Telemetry, RAM Model Registry, Gates Engine, and Execution Gateway.
+          - Hydrate the 5-row FSM state from Supabase `asset_state` once into RAM.
+          - Reconcile with live Binance matching engine positions.
+  Step 3: Self-Chaining Workflow Dispatcher (`dispatch_successor_workflow`):
+          - Dispatches `runners.yml` at minute 320 to maintain unbroken continuous execution.
+  Step 4: Fast Loop — Synthetic Barrier Vigilance (Every 2.0 Seconds):
+          - Fetch real-time Mark Prices for all assets via single 1-weight call.
+          - For coins in 'MAIN' or 'CONTROL': Check if Mark Price breaches Target TP or Target SL.
+          - If breached: Fire immediate Market Close (`reduceOnly: True`), log terminal receipt,
+            and transition state to 'AWAITING' (Flat).
+  Step 5: Slow Pipeline — 15-Minute Crossover Evaluation (T+5.0s Buffer):
+          - Ingest closed OHLCV across 15m (100 bars), 4h (60 bars), 1d (50 bars).
+          - Detect 9/15 EMA crossover on closed candle (Index -1 vs. -2).
+          - If crossover fires on active coin: Liquidate immediately (SIGNAL_FLIP).
+          - Extract true 15-bar rolling sequence for Funnel GRU inference.
+          - Evaluate Risk Gates (Soft-Gate Hurdle + 5-Slot Concurrency Cap).
+          - Log 100% of crossover events to Supabase `crossover_telemetry_stream`.
+          - If approved: Dispatch Market Entry, set Target TP/SL in RAM, transition state to MAIN/CONTROL.
+  Step 6: Master Phase-Locked Loop:
+          - Synchronize sleep cycle to maintain the 2.0s fast heartbeat while targeting exact :05.00s.
 ====================================================================================================
 """
 
@@ -45,21 +53,24 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 try:
     from src.telemetry import TelemetryEngine
-    from src.features import fetch_closed_ohlcv, detect_crossover, compute_production_features, ProductionFeaturePipeline
+    from src.features import fetch_closed_ohlcv, detect_crossover, extract_rolling_features_history
     from src.models_engine import ProductionModelRegistry
     from src.gates_engine import ProductionGatesEngine
-    from src.execution import ExecutionEngine
+    from src.execution import ExecutionGateway
 except ImportError:
     from telemetry import TelemetryEngine
-    from features import fetch_closed_ohlcv, detect_crossover, compute_production_features, ProductionFeaturePipeline
+    from features import fetch_closed_ohlcv, detect_crossover, extract_rolling_features_history
     from models_engine import ProductionModelRegistry
     from gates_engine import ProductionGatesEngine
-    from execution import ExecutionEngine
+    from execution import ExecutionGateway
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# =============================================================================
+# STEP 1: Environment Ingestion & Output Formatting
+# =============================================================================
 MAX_RUN_DURATION_MINUTES = 320
-HEARTBEAT_INTERVAL_SEC   = 10
+FAST_LOOP_INTERVAL_SEC   = 2.0
 SETTLEMENT_BUFFER_SEC    = 5.0
 
 GITHUB_TOKEN      = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN", "").strip()
@@ -68,8 +79,11 @@ BINANCE_KEY       = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
 BINANCE_SECRET    = os.environ.get("BINANCE_TESTNET_API_SECRET", "").strip()
 BINANCE_PROXY     = os.environ.get("BINANCE_PROXY_URL", "").strip()
 
+ACTIVE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
+
 
 def format_price(price: float) -> str:
+    """Formats asset price based on magnitude precision."""
     if price < 1.0:
         return f"${price:.4f}"
     elif price < 10.0:
@@ -79,64 +93,64 @@ def format_price(price: float) -> str:
 
 
 # =============================================================================
-# STEP 2: Engine Initialization & Startup Handover Sweeper
+# STEP 2: Engine Initialization & Single-Read Cold-Start Hydration
 # =============================================================================
 print("===============================================================================")
-print("  EMA_TESTNET PRODUCTION DAEMON (VERSION 2.0: EXPERIMENTAL A/B DESK)           ")
+print("  EMA_TESTNET PRODUCTION DAEMON (VERSION 3.0: PURE MARKET FSM DESK)            ")
 print(f"  Max Lifespan     : {MAX_RUN_DURATION_MINUTES} Minutes ({MAX_RUN_DURATION_MINUTES/60:.2f} Hours)")
-print(f"  Target Repository: {GITHUB_REPOSITORY} | Dispatch: runners.yml               ")
-print(f"  Execution Mode   : Immediate Market Entry (100% Deterministic Fills)         ")
+print(f"  Target Repository: {GITHUB_REPOSITORY} | Workflow: runners.yml               ")
+print(f"  Execution Mode   : Pure Market Entries & Exits (Zero Conditional Orders)     ")
+print(f"  Vigilance Cycle  : 2.0s Fast Mark Price Loop (Weight = 1)                    ")
 print("===============================================================================\n")
 
-print("1. Initializing Telemetry and Database Connections...")
+print("1. Initializing Persistence Gateway...")
 telemetry = TelemetryEngine()
 
-print("2. Loading 48 Production Models into RAM...")
+print("2. Loading Production Models into RAM Singleton...")
 model_registry = ProductionModelRegistry()
 gates_engine   = ProductionGatesEngine()
 
-print("3. Connecting Execution Engine to Binance Futures Testnet...")
-execution = ExecutionEngine(
+print("3. Connecting Pure Market Execution Gateway to Binance Futures Testnet...")
+execution = ExecutionGateway(
     api_key=BINANCE_KEY,
     api_secret=BINANCE_SECRET,
-    proxy_url=BINANCE_PROXY,
-    telemetry=telemetry
+    proxy_url=BINANCE_PROXY
 )
 
-ACTIVE_SYMBOLS = ["BTCUSDT", "DOGEUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-last_evaluated_15m_block = None
-last_evaluated_candles = {sym: None for sym in ACTIVE_SYMBOLS}
+# ── 1. COLD-START HYDRATION: Single Read from Supabase Table 1 on Boot ──
+print("4. Hydrating FSM State from Supabase `asset_state` (One-Time Startup Read)...")
+fsm_ram_state = telemetry.hydrate_fsm_state()
 
-# ── 1. GHOST SWEEPER ON BOOT: Purge all ancient orders from Binance ──
-execution.purge_unlinked_ghost_orders(ACTIVE_SYMBOLS)
-
-# ── 2. STATE HYDRATION (ONE READ ON BOOT) ──
-print("4. Hydrating active trade state from Supabase Table 1...")
-active_by_symbol = telemetry.hydrate_active_trades_from_db()
-
-# Reconcile with live Binance matching engine positions
+# ── 2. RECONCILE WITH PHYSICAL BINANCE POSITIONS ──
 live_positions = execution.get_active_positions()
 for sym, pos_data in live_positions.items():
-    if sym not in active_by_symbol:
-        print(f"[Reconciliation] Live Binance position detected for {sym}. Tracking in RAM.")
-        active_by_symbol[sym] = {
-            "id": None,
-            "symbol": sym,
-            "direction": pos_data["side"].upper(),
-            "trade_tier": "MAIN",
-            "entry_price": pos_data["entry_price"],
-            "contract_quantity": pos_data["contracts"],
-            "allocated_cash": pos_data["contracts"] * pos_data["entry_price"],
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
+    if sym in fsm_ram_state:
+        current_state = fsm_ram_state[sym]["state"]
+        if current_state == "AWAITING":
+            print(f"[Reconciliation] Physical position detected on Binance for {sym} while AWAITING. Tracking in RAM.")
+            fsm_ram_state[sym]["state"] = "MAIN"
+            fsm_ram_state[sym]["direction"] = pos_data["side"].upper()
+            fsm_ram_state[sym]["entry_price"] = pos_data["entry_price"]
+            fsm_ram_state[sym]["contract_quantity"] = pos_data["contracts"]
+            fsm_ram_state[sym]["allocated_cash"] = pos_data["contracts"] * pos_data["entry_price"]
+            # Set default 0.5% SL and 1.5% TP barrier if unrecorded
+            dir_mult = 1.0 if pos_data["side"].upper() == "LONG" else -1.0
+            fsm_ram_state[sym]["target_tp"] = pos_data["entry_price"] * (1.0 + (dir_mult * 0.015))
+            fsm_ram_state[sym]["target_sl"] = pos_data["entry_price"] * (1.0 - (dir_mult * 0.005))
+            telemetry.transition_asset_state(fsm_ram_state[sym])
 
-print(f"Active Slots Deployed: {len(active_by_symbol)} / 5 slots.\n")
+active_count = sum(1 for data in fsm_ram_state.values() if data["state"] in ["MAIN", "CONTROL"])
+print(f"FSM State Initialized in RAM: {active_count} / 5 slots active.\n")
+
+last_evaluated_15m_block = None
+last_evaluated_candles   = {sym: None for sym in ACTIVE_SYMBOLS}
 
 
 # =============================================================================
-# STEP 3: Self-Chaining Dispatcher (Targeting runners.yml via GH_PAT)
+# STEP 3: Self-Chaining Workflow Dispatcher (Targeting runners.yml)
 # =============================================================================
-def dispatch_successor_workflow():
+def dispatch_successor_workflow() -> bool:
+    """Dispatches next runner before GitHub Actions 6-hour execution timeout kills job."""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         print("[Warning] GITHUB_TOKEN/GH_PAT missing. Relying on scheduled cron triggers.")
         return False
@@ -148,7 +162,7 @@ def dispatch_successor_workflow():
     }
     payload = {"ref": "main"}
 
-    print(f"\n[Self-Chaining] Dispatching successor job to {GITHUB_REPOSITORY} via runners.yml...")
+    print(f"\n[Self-Chaining] Dispatching successor runner to {GITHUB_REPOSITORY} via runners.yml...")
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=15)
         if res.status_code in [204, 201, 200]:
@@ -163,91 +177,106 @@ def dispatch_successor_workflow():
 
 
 # =============================================================================
-# STEP 4: Silent In-Memory Position Maintenance (Every 10 Seconds)
+# STEP 4: Fast Loop — Synthetic Barrier Vigilance (Every 2.0 Seconds)
 # =============================================================================
-def run_position_maintenance():
-    global active_by_symbol
-    
-    if not active_by_symbol:
+def run_fast_barrier_check():
+    """
+    Queries real-time Mark Prices for all assets in ONE call (Weight = 1).
+    Evaluates synthetic barriers for active coins in RAM and fires market exits.
+    Zero conditional orders on Binance. Zero database reads.
+    """
+    global fsm_ram_state
+
+    # 1. Check if any coin is active before querying
+    active_symbols = [s for s, d in fsm_ram_state.items() if d["state"] in ["MAIN", "CONTROL"]]
+    if not active_symbols:
+        return
+
+    # 2. Fetch all Mark Prices via 1-weight public endpoint
+    mark_prices = execution.get_all_mark_prices()
+    if not mark_prices:
         return
 
     now_utc = datetime.now(timezone.utc)
-    live_positions = execution.get_active_positions()
-    symbols_to_remove = []
 
-    for sym, trade in list(active_by_symbol.items()):
-        # Check if position has closed on Binance matching engine
-        if sym not in live_positions:
-            created_dt = pd.to_datetime(trade["created_at"], utc=True)
-            hold_mins = max(0.1, (now_utc - created_dt).total_seconds() / 60.0)
-            direction = trade["direction"].upper()
-            entry_fill = float(trade["entry_price"])
+    for sym in active_symbols:
+        trade = fsm_ram_state[sym]
+        current_mark = mark_prices.get(sym)
+        if not current_mark or current_mark <= 0.0:
+            continue
 
-            tp_id = trade.get("binance_tp_id")
-            sl_id = trade.get("binance_sl_id")
-            exit_price = None
-            close_reason = None
-            fees_paid = 0.0
+        direction = trade["direction"].upper()
+        target_tp = float(trade["target_tp"])
+        target_sl = float(trade["target_sl"])
+        entry_px  = float(trade["entry_price"])
+        qty       = float(trade["contract_quantity"])
+        cash      = float(trade["allocated_cash"])
+        tier      = trade.get("trade_tier", "MAIN")
 
-            # Check exact TP Order fill
-            if tp_id and "MOCK" not in str(tp_id):
-                try:
-                    tp_info = execution.exchange.fetch_order(tp_id, sym)
-                    if tp_info.get("status", "").lower() == "closed":
-                        exit_price = float(tp_info.get("average") or tp_info.get("price") or trade["dynamic_tp_price"])
-                        close_reason = "TP_HIT"
-                        fees_paid = float(tp_info.get("fee", {}).get("cost", 0.0))
-                except Exception:
-                    pass
+        close_reason = None
 
-            # Check exact SL Order fill
-            if not close_reason and sl_id and "MOCK" not in str(sl_id):
-                try:
-                    sl_info = execution.exchange.fetch_order(sl_id, sym)
-                    if sl_info.get("status", "").lower() == "closed":
-                        exit_price = float(sl_info.get("average") or sl_info.get("price") or trade["dynamic_sl_price"])
-                        close_reason = "SL_HIT"
-                        fees_paid = float(sl_info.get("fee", {}).get("cost", 0.0))
-                except Exception:
-                    pass
-
-            if not close_reason:
-                exit_price = float(trade.get("dynamic_sl_price", entry_fill))
+        # Barrier Breach Evaluation
+        if direction == "LONG":
+            if current_mark >= target_tp and target_tp > 0:
+                close_reason = "TP_HIT"
+            elif current_mark <= target_sl and target_sl > 0:
                 close_reason = "SL_HIT"
-                fees_paid = float(trade["allocated_cash"]) * 0.0008
+        elif direction == "SHORT":
+            if current_mark <= target_tp and target_tp > 0:
+                close_reason = "TP_HIT"
+            elif current_mark >= target_sl and target_sl > 0:
+                close_reason = "SL_HIT"
 
-            gross_ret = (exit_price - entry_fill) / entry_fill if direction == "LONG" else (entry_fill - exit_price) / entry_fill
-            realized_pnl = (float(trade["allocated_cash"]) * gross_ret) - fees_paid
+        # Execute Immediate Market Exit on Breach
+        if close_reason:
+            print(f"\n[Synthetic Barrier Breach] {sym} {direction} ({tier}) reached {close_reason} at {format_price(current_mark)}!")
+            exit_px, real_pnl, fees = execution.execute_market_close(
+                symbol=sym,
+                direction=direction,
+                quantity=qty,
+                entry_price=entry_px,
+                allocated_cash=cash,
+                close_reason=close_reason
+            )
 
-            print(f"[Position Closed on Binance] {sym} {direction} ({trade.get('trade_tier', 'MAIN')}) exited via {close_reason} @ {format_price(exit_price)} (Net PnL: ${realized_pnl:+,.2f})")
-            print(f"   --> {sym} is now FLAT. Waiting for the next fresh 9/15 EMA crossover.")
-
+            # Record Terminal Receipt in Supabase Table 2 (and reset asset_state to AWAITING)
             telemetry.record_trade_closure({
                 "symbol": sym,
                 "direction": direction,
-                "trade_tier": trade.get("trade_tier", "MAIN"),
+                "trade_tier": tier,
                 "close_reason": close_reason,
-                "entry_price": entry_fill,
-                "exit_price": exit_price,
-                "realized_binance_pnl": realized_pnl,
-                "idealized_pnl": realized_pnl + fees_paid,
+                "entry_price": entry_px,
+                "exit_price": exit_px,
+                "realized_binance_pnl": real_pnl,
+                "idealized_pnl": real_pnl + fees,
                 "friction_loss": 0.0,
-                "exchange_fees_paid": fees_paid,
-                "hold_duration_minutes": hold_mins,
-                "notes": f"Verified Binance execution ({close_reason})"
+                "exchange_fees_paid": fees,
+                "hold_duration_minutes": 0.0,
+                "opened_at": trade.get("updated_at"),
+                "notes": f"Synthetic barrier trigger ({close_reason})"
             })
-            symbols_to_remove.append(sym)
 
-    for s in symbols_to_remove:
-        if s in active_by_symbol:
-            del active_by_symbol[s]
+            # Update In-Memory FSM State to AWAITING (Flat)
+            fsm_ram_state[sym]["state"]             = "AWAITING"
+            fsm_ram_state[sym]["direction"]         = "NONE"
+            fsm_ram_state[sym]["entry_price"]       = 0.0
+            fsm_ram_state[sym]["target_tp"]         = 0.0
+            fsm_ram_state[sym]["target_sl"]         = 0.0
+            fsm_ram_state[sym]["contract_quantity"] = 0.0
+            fsm_ram_state[sym]["allocated_cash"]    = 0.0
+            fsm_ram_state[sym]["trade_tier"]        = "NONE"
+            print(f"   --> {sym} state transitioned to AWAITING. Locked until next fresh crossover.\n")
 
 
 # =============================================================================
-# STEP 5: 15-Minute Pipeline (100% Crossover Telemetry & Market Routing)
+# STEP 5: Slow Pipeline — 15-Minute Crossover Evaluation (T+5.0s Buffer)
 # =============================================================================
 def run_candle_close_pipeline():
-    global active_by_symbol, last_evaluated_candles
+    """
+    Evaluates finalized 15m candle closes at T+5.0s.
+    Executes Signal Inversions (Reversals) and routes Market Entries.
+    """
+    global fsm_ram_state, last_evaluated_candles
     t_start = time.perf_counter()
     eval_time_str = datetime.now(timezone.utc).strftime('%H:%M:%S')
 
@@ -256,15 +285,15 @@ def run_candle_close_pipeline():
     print(f"───────────────────────────────────────────────────────────────────────────────")
 
     free_cash = execution.get_free_usdt_balance()
-    live_binance_positions = execution.get_active_positions()
-
-    print(f"Active Slots Deployed: {len(active_by_symbol)} / 5 | Free Cash Available: ${free_cash:,.2f} USDT")
+    active_count = sum(1 for d in fsm_ram_state.values() if d["state"] in ["MAIN", "CONTROL"])
+    print(f"Active Slots Deployed: {active_count} / 5 | Free Cash Available: ${free_cash:,.2f} USDT")
 
     for symbol in ACTIVE_SYMBOLS:
         try:
-            df_15m = fetch_closed_ohlcv(execution.exchange, symbol, '15m', limit=60)
-            df_4h  = fetch_closed_ohlcv(execution.exchange, symbol, '4h',  limit=40)
-            df_1d  = fetch_closed_ohlcv(execution.exchange, symbol, '1d',  limit=25)
+            # Multi-timeframe ingestion with complete mathematical warmup
+            df_15m = fetch_closed_ohlcv(execution.exchange, symbol, '15m', limit=100)
+            df_4h  = fetch_closed_ohlcv(execution.exchange, symbol, '4h',  limit=60)
+            df_1d  = fetch_closed_ohlcv(execution.exchange, symbol, '1d',  limit=50)
 
             signal, cross_price, candle_close_utc = detect_crossover(df_15m)
 
@@ -274,59 +303,75 @@ def run_candle_close_pipeline():
             # Idempotent bar deduplication guard
             if last_evaluated_candles.get(symbol) == candle_close_utc:
                 continue
-
             last_evaluated_candles[symbol] = candle_close_utc
 
-            # ── STRICT SIGNAL INVERSION ASSERTION ──
-            # If an active position exists on this coin, ANY crossover is strictly asserted as an inversion
-            has_ram_trade = symbol in active_by_symbol
-            has_live_pos  = symbol in live_binance_positions
+            current_trade = fsm_ram_state[symbol]
+            current_state = current_trade["state"]
+            is_active     = current_state in ["MAIN", "CONTROL"]
+            is_reversal   = False
 
-            if has_ram_trade or has_live_pos:
-                active_record = active_by_symbol.get(symbol)
-                pos_dir = active_record["direction"].upper() if active_record else live_binance_positions[symbol]["side"].upper()
+            # ── 1. SIGNAL INVERSION (REVERSAL ON ACTIVE ASSET) ──
+            if is_active:
+                pos_dir = current_trade["direction"].upper()
+                if signal != pos_dir:
+                    print(f"\n[Signal Inversion] {signal} crossover fires against active {pos_dir} on {symbol}! Liquidating immediately...")
+                    exit_px, real_pnl, fees = execution.execute_market_close(
+                        symbol=symbol,
+                        direction=pos_dir,
+                        quantity=float(current_trade["contract_quantity"]),
+                        entry_price=float(current_trade["entry_price"]),
+                        allocated_cash=float(current_trade["allocated_cash"]),
+                        close_reason="SIGNAL_FLIP"
+                    )
 
-                print(f"\n[Crossover Inversion] {signal} crossover fires against active {pos_dir}! Liquidating immediately...")
+                    telemetry.record_trade_closure({
+                        "symbol": symbol,
+                        "direction": pos_dir,
+                        "trade_tier": current_trade.get("trade_tier", "MAIN"),
+                        "close_reason": "SIGNAL_FLIP",
+                        "entry_price": float(current_trade["entry_price"]),
+                        "exit_price": exit_px,
+                        "realized_binance_pnl": real_pnl,
+                        "idealized_pnl": real_pnl + fees,
+                        "friction_loss": 0.0,
+                        "exchange_fees_paid": fees,
+                        "hold_duration_minutes": 0.0,
+                        "opened_at": current_trade.get("updated_at"),
+                        "notes": "Closed on confirmed opposite 9/15 EMA crossover"
+                    })
 
-                trade_to_close = active_record or {
-                    "id": None,
-                    "symbol": symbol,
-                    "direction": pos_dir,
-                    "trade_tier": "MAIN",
-                    "contract_quantity": live_binance_positions[symbol]["contracts"],
-                    "entry_price": live_binance_positions[symbol]["entry_price"],
-                    "allocated_cash": live_binance_positions[symbol]["contracts"] * live_binance_positions[symbol]["entry_price"],
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }
+                    fsm_ram_state[symbol]["state"] = "AWAITING"
+                    free_cash = execution.get_free_usdt_balance()
+                    is_reversal = True
+                else:
+                    # Same direction crossover on an already open trade -> ignore
+                    continue
 
-                execution.execute_signal_flip_close(trade_to_close)
+            print(f"\n[Crossover Fired] {symbol} -> {signal} at {format_price(cross_price)} (Bar Close: {candle_close_utc})")
 
-                if symbol in active_by_symbol:
-                    del active_by_symbol[symbol]
-                free_cash = execution.get_free_usdt_balance()
+            # ── 2. TRUE ROLLING SEQUENCE EXTRACTION FOR GRU ──
+            recent_history = extract_rolling_features_history(df_15m, df_4h, df_1d, seq_len=15)
+            features_latest = recent_history[-1]
 
-            print(f"\n[Crossover Fired] {symbol} -> {signal} at {format_price(cross_price)} (Candle Close: {candle_close_utc})")
-
-            # Extract 25 master indicators + 15m ATR %
-            features_25 = compute_production_features(df_15m, df_4h, df_1d)
-            recent_history = [features_25] * 30
-            model_outputs  = model_registry.predict_trade_setup(symbol, signal, features_25, recent_history)
-
+            # ── 3. REAL-TIME MODEL INFERENCE ──
+            model_outputs = model_registry.predict_trade_setup(symbol, signal, features_latest, recent_history)
             print(f"   --> Predictions: Profit MFE={model_outputs['pred_profit_mfe']:.2f}% | Danger MAE={model_outputs['pred_danger_mae']:.2f}%")
             print(f"   --> Gates      : Prob(Profit)={model_outputs['prob_profit']:.3f} | Prob(Danger)={model_outputs['prob_danger']:.3f}")
 
-            # Evaluate Gates & Sizing (Dynamic Soft-Gate + ATR Noise Clamp)
+            # ── 4. EVALUATE GATES & SIZING ──
+            active_count = sum(1 for d in fsm_ram_state.values() if d["state"] in ["MAIN", "CONTROL"])
             manifest = gates_engine.evaluate_gates_and_sizing(
                 symbol=symbol,
                 direction=signal,
                 entry_price=cross_price,
                 model_outputs=model_outputs,
-                atr_pct=features_25.get('atr_pct', 0.40),
+                atr_pct=features_latest.get('atr_pct', 0.40),
                 free_wallet_balance=free_cash,
-                active_positions_count=len(active_by_symbol)
+                active_positions_count=active_count,
+                is_reversal=is_reversal
             )
 
-            # ── 1. LOG 100% OF CROSSOVERS TO SUPABASE TABLE 3 (TELEMETRY STREAM) ──
+            # ── 5. LOG 100% OF CROSSOVERS TO SUPABASE TABLE 3 ──
             telemetry.record_crossover_telemetry({
                 "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
                 "symbol": symbol,
@@ -338,95 +383,101 @@ def run_candle_close_pipeline():
                 "prob_danger": manifest["prob_danger"],
                 "rr_ratio": manifest["rr_ratio"],
                 "gate_verdict": manifest["trade_tier"],
-                "gate_combo_tag": manifest["gate_combo_tag"],
+                "gate_combo_tag": manifest.get("gate_combo_tag", "NONE"),
                 "rejection_reason": manifest["rejection_reason"],
                 "dynamic_tp_pct": manifest["dynamic_tp_pct"],
                 "dynamic_sl_pct": manifest["dynamic_sl_pct"],
-                "noise_ratio": manifest["noise_ratio"],
+                "noise_ratio": manifest.get("noise_ratio", 1.0),
                 "wallet_balance_usd": free_cash
             })
 
-            # ── 2. ROUTE MARKET ENTRY ON BINANCE (100% OF CROSSOVERS TRADED) ──
-            print(f"   --> [EXECUTION] Tier: {manifest['trade_tier']} | Cash: ${manifest['allocated_cash']:,.2f} | R:R: {manifest['rr_ratio']}:1")
-            print(f"       Dynamic TP: {format_price(manifest['dynamic_tp_price'])} | Dynamic SL: {format_price(manifest['dynamic_sl_price'])}")
+            if not manifest.get("approved", True):
+                print(f"   --> [REJECTED] {manifest['rejection_reason']}")
+                continue
 
-            trade_id, binance_order_id, tp_id, sl_id, actual_fill_px = execution.execute_market_entry(manifest, candle_close_utc)
+            # ── 6. EXECUTE IMMEDIATE MARKET ENTRY ON BINANCE ──
+            print(f"   --> [ENTRY ORDER] Tier: {manifest['trade_tier']} | Cash: ${manifest['allocated_cash']:,.2f} | R:R: {manifest['rr_ratio']}:1")
+            print(f"       Target TP: {format_price(manifest['dynamic_tp_price'])} | Target SL: {format_price(manifest['dynamic_sl_price'])}")
 
-            active_by_symbol[symbol] = {
-                "id": trade_id,
-                "binance_order_id": binance_order_id,
-                "binance_tp_id": tp_id,
-                "binance_sl_id": sl_id,
+            order_id, actual_fill_px, clean_contracts = execution.execute_market_entry(manifest)
+
+            # Re-derive exact barriers from authentic fill price
+            tp_pct = manifest["dynamic_tp_pct"] / 100.0
+            sl_pct = manifest["dynamic_sl_pct"] / 100.0
+            if signal == "LONG":
+                target_tp_px = actual_fill_px * (1.0 + tp_pct)
+                target_sl_px = actual_fill_px * (1.0 - sl_pct)
+            else:
+                target_tp_px = actual_fill_px * (1.0 - tp_pct)
+                target_sl_px = actual_fill_px * (1.0 + sl_pct)
+
+            # ── 7. PERSIST FSM TRANSITION TO RAM & ASSET_STATE TABLE ──
+            new_fsm_state = {
                 "symbol": symbol,
+                "state": manifest["trade_tier"],
                 "direction": signal,
-                "trade_tier": manifest["trade_tier"],
-                "contract_quantity": manifest["contract_quantity"],
                 "entry_price": actual_fill_px,
+                "target_tp": target_tp_px,
+                "target_sl": target_sl_px,
+                "contract_quantity": clean_contracts,
                 "allocated_cash": manifest["allocated_cash"],
-                "dynamic_tp_price": manifest["dynamic_tp_price"],
-                "dynamic_sl_price": manifest["dynamic_sl_price"],
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "trade_tier": manifest["trade_tier"]
             }
+
+            fsm_ram_state[symbol] = new_fsm_state
+            telemetry.transition_asset_state(new_fsm_state)
             free_cash = execution.get_free_usdt_balance()
 
         except Exception as e:
-            print(f"[Signal Error] Failed to process {symbol}: {repr(e)}")
+            print(f"[Pipeline Error] Failed processing {symbol}: {repr(e)}")
 
     elapsed_pipeline = time.perf_counter() - t_start
-    print(f"\n15-Minute Pipeline Completed in {elapsed_pipeline:.2f}s (Target: < 20s).")
+    print(f"15-Minute Pipeline Completed in {elapsed_pipeline:.2f}s.")
 
 
 # =============================================================================
-# STEP 6: Master Phase-Locked Execution Loop (Target: Exact :05.00 Close)
+# STEP 6: Master Phase-Locked Loop (Fast Heartbeat + Slow Trigger)
 # =============================================================================
 def main():
     global last_evaluated_15m_block
     daemon_start_time = time.time()
-    print(f"[Daemon Started] Continuous Silent Heartbeat active at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.")
+    print(f"\n[Daemon Active] Two-speed execution loop operational at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.")
 
     while True:
         try:
             now_dt = datetime.now(timezone.utc)
             elapsed_minutes = (time.time() - daemon_start_time) / 60.0
 
-            # 1. Self-Chaining Lifespan Check at 320 Mins (5h 20m)
+            # 1. Handover Lifespan Check at Minute 320 (5 Hours 20 Minutes)
             if elapsed_minutes >= MAX_RUN_DURATION_MINUTES:
-                print(f"\n[Lifespan Reached] {elapsed_minutes:.1f} / {MAX_RUN_DURATION_MINUTES} Mins elapsed. Handover initiated.")
+                print(f"\n[Lifespan Reached] {elapsed_minutes:.1f} / {MAX_RUN_DURATION_MINUTES} Mins. Handing over to next runner...")
                 success = dispatch_successor_workflow()
                 if success:
-                    time.sleep(15)
+                    time.sleep(10)
                     break
                 else:
-                    daemon_start_time += 900
+                    daemon_start_time += 900  # Extend lifespan 15m if dispatch had network hiccup
 
-            # 2. Clock Discovery
+            # 2. Clock Resolution
             current_minute = now_dt.minute
             current_second = now_dt.second
             current_15m_block = (now_dt.year, now_dt.month, now_dt.day, now_dt.hour, current_minute // 15)
 
-            seconds_into_15m = (current_minute % 15) * 60 + current_second
-            seconds_until_close = 900 - seconds_into_15m
+            # 3. FAST LOOP: Synthetic Barrier Vigilance (Every 2.0 Seconds)
+            run_fast_barrier_check()
 
-            # 3. CLOCK-FIRST PRIORITY: Execute candle pipeline at T+5.0s
+            # 4. SLOW PIPELINE: Execute Candle Pipeline at T+5.0s Past Close
             is_candle_close_window = (current_minute % 15 == 0) and (current_second >= SETTLEMENT_BUFFER_SEC)
-
             if is_candle_close_window and (last_evaluated_15m_block != current_15m_block):
                 run_candle_close_pipeline()
                 last_evaluated_15m_block = current_15m_block
 
-            # 4. Silent In-Memory Maintenance
-            run_position_maintenance()
-
-            # 5. Phase-Locked Sleep: Wake up precisely at T+5.0s past next close
-            if seconds_until_close <= 15:
-                sleep_duration = seconds_until_close + SETTLEMENT_BUFFER_SEC
-                time.sleep(max(1.0, sleep_duration))
-            else:
-                time.sleep(HEARTBEAT_INTERVAL_SEC)
+            # 5. Fast Heartbeat Sleep
+            time.sleep(FAST_LOOP_INTERVAL_SEC)
 
         except Exception as e:
-            print(f"[Daemon Heartbeat Exception] Recovering: {repr(e)}")
-            time.sleep(10)
+            print(f"[Daemon Loop Notice] Recovering from error: {repr(e)}")
+            time.sleep(FAST_LOOP_INTERVAL_SEC)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+{
+  "capital_and_slots": {
+    "total_slots": 4,
+    "max_cash_per_slot": 1000.0,
+    "fixed_main_cash": 1000.0,
+    "fixed_control_cash": 50.0,
+    "fixed_leverage": 1.0
+  },
+  "active_symbols": [
+    "ETHUSDT",
+    "SOLUSDT",
+    "DOGEUSDT",
+    "XRPUSDT"
+  ]
+}

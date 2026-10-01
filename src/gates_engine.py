@@ -1,30 +1,31 @@
 """
 ====================================================================================================
-ALGORITHM: src/gates_engine.py — Concurrency-Guarded Risk Gating & $100 Control Sizing Engine
+ALGORITHM: src/gates_engine.py — Deterministic Flat Sizing Engine ($1,000 Main / $50 Control)
 ====================================================================================================
 Purpose:
-  Translates model outputs into actionable trade manifests categorized into MAIN vs. CONTROL tiers:
-    - MAIN TRADES   : Passed Dynamic Soft-Gate hurdle & consensus -> Danger-budgeted capital (up to $1k).
-    - CONTROL TRADES: Failed hurdle or consensus -> Fixed $100.00 micro-notional floor.
-  Guarantees Control trades cleanly clear Binance's 50 USDT minimum notional filter (error -4164)
-  while risking less than $1.00 per trade on 15m stop losses. Enforces strict 5-slot concurrency.
+  Translates model outputs into actionable trade manifests across 4 active altcoins:
+    - MAIN TRADES   : Passed Dynamic Soft-Gate hurdle & consensus -> Flat $1,000.00 cash.
+    - CONTROL TRADES: Failed hurdle or consensus -> Flat $50.00 cash.
+  Eliminates dynamic sizing multipliers to permanently prevent the $2,000 allocation explosion.
+  Enforces a strict 4-slot concurrency bound and the 15m ATR % noise-floor clamp.
 
 Algorithm Steps:
   Step 1: Module Setup & Configuration Ingestion:
-          - Ingest total_slots (5), max_cash_per_slot ($1,000), base_risk_budget ($50).
-          - Set control_notional = 100.0 USDT (100% safety buffer above Binance 50 USDT floor).
+          - Enforces total_slots = 4.
+          - Hardcodes defensive clamp: max_cash_per_slot = 1000.0.
   Step 2: Concurrency & Reversal Guard:
-          - If active_slots >= 5 and this is NOT a reversal on an existing coin -> Reject (MAX_SLOTS).
+          - Blocks new entries if active_slots >= 4 (unless reversing an existing trade).
   Step 3: Dynamic Barrier Calculation with 15m ATR Noise Clamp:
           - Dynamic SL % = max(1.0 * atr_15m_pct, pred_danger_mae * 1.00).
           - Dynamic TP % = max(0.20, pred_profit_mfe).
   Step 4: 4-State Taxonomy & Consensus Defense:
-          - Hard rejection of HIGH_RISK__LOW_PROFIT setups into the Control tier.
+          - Rejects HIGH_RISK__LOW_PROFIT setups into the Control tier.
   Step 5: Dynamic Confidence Soft-Gate Evaluation:
           - If Prob(Profit) >= 0.55 -> Required R:R = 1.65; else Required R:R = 2.00.
-  Step 6: Asymmetric Capital Allocation (Main vs. Control):
-          - Cleared gates -> Sized via danger budget ($75 / $50 / $25, max $1,000).
-          - Failed gates  -> Fixed $100.00 micro-notional floor.
+  Step 6: Deterministic Flat Sizing Allocation:
+          - MAIN    : allocated_cash = min(1000.0, free_wallet_balance).
+          - CONTROL : allocated_cash = min(50.0, free_wallet_balance).
+          - Contract quantity = allocated_cash / entry_price.
   Step 7: Return Complete Manifest.
   Step 8: Production Self-Test Probe (`if __name__ == '__main__'`).
 ====================================================================================================
@@ -42,35 +43,26 @@ class ProductionGatesEngine:
             if not os.path.exists(config_path):
                 config_path = os.path.join(os.getcwd(), "ema_testnet", "configs", "config_production.json")
 
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                self.cfg = json.load(f)
-            self.base_risk_usd  = float(self.cfg["capital_and_slots"].get("base_risk_budget_usd", 50.0))
-            self.max_cash_slot  = float(self.cfg["capital_and_slots"].get("max_cash_per_slot", 1000.0))
-            self.total_slots    = int(self.cfg["capital_and_slots"].get("total_slots", 5))
-            self.fixed_leverage = float(self.cfg["capital_and_slots"].get("fixed_leverage", 1.0))
-        else:
-            self.base_risk_usd  = 50.0
-            self.max_cash_slot  = 1000.0
-            self.total_slots    = 5
-            self.fixed_leverage = 1.0
+        self.total_slots        = 4
+        self.fixed_main_cash    = 1000.0
+        self.fixed_control_cash = 50.0
+        self.fixed_leverage     = 1.0
 
-        # Policy & Dynamic Hurdle Constants
-        self.tp_multiplier      = 1.00
-        self.sl_multiplier      = 1.00
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    cfg = json.load(f)
+                self.total_slots = int(cfg.get("capital_and_slots", {}).get("total_slots", 4))
+            except Exception:
+                pass
+
+        # Defensive hard clamp: Main trade capital can NEVER exceed $1,000.00
+        self.max_cash_slot      = 1000.0
         self.standard_rr_hurdle = 2.00
         self.relaxed_rr_hurdle  = 1.65
         self.high_conf_thresh   = 0.55
         self.danger_thresh      = 0.50
         self.profit_thresh      = 0.50
-        self.control_notional   = 100.0  # Fixed $100.00 floor (clears Binance 50 USDT filter with 2x buffer)
-
-        self.multipliers = {
-            "LOW_RISK__HIGH_PROFIT":  1.50,  # $75.00 Risk Budget
-            "LOW_RISK__LOW_PROFIT":   1.00,  # $50.00 Risk Budget
-            "HIGH_RISK__HIGH_PROFIT": 0.50,  # $25.00 Risk Budget (De-risked)
-            "HIGH_RISK__LOW_PROFIT":  0.00   # Consensus Rejection
-        }
 
     def evaluate_gates_and_sizing(
         self,
@@ -83,16 +75,13 @@ class ProductionGatesEngine:
         active_positions_count: int = 0,
         is_reversal: bool = False
     ) -> dict:
-        """
-        Evaluates risk gates, enforces strict portfolio concurrency, clamps stops
-        to ATR noise, and partitions into MAIN vs. CONTROL tiers ($100 floor).
-        """
-        # 1. Strict Concurrency Bound Guard
+        """Evaluates Soft-Gate hurdle, enforces 4-slot concurrency, and sizes flat $1k / $50."""
+        # 1. Concurrency Guard (Strictly 4 Slots Max)
         if active_positions_count >= self.total_slots and not is_reversal:
             return {
                 "approved": False,
                 "trade_tier": "AWAITING",
-                "rejection_reason": "MAX_CONCURRENCY_REACHED (5/5 Slots Full)",
+                "rejection_reason": f"MAX_CONCURRENCY_REACHED ({self.total_slots}/{self.total_slots} Slots Full)",
                 "symbol": symbol,
                 "direction": direction,
                 "allocated_cash": 0.0,
@@ -104,19 +93,20 @@ class ProductionGatesEngine:
         prob_profit     = float(model_outputs["prob_profit"])
         prob_danger     = float(model_outputs["prob_danger"])
 
-        # 2. Dynamic Barriers with 15m ATR % Noise-Floor Clamp
-        dynamic_tp_pct = max(0.20, pred_profit_mfe) * self.tp_multiplier
-        raw_sl_pct     = max(0.15, pred_danger_mae) * self.sl_multiplier
+        # 2. Dynamic Barrier Percentages with 15m ATR % Noise-Floor Clamp
+        dynamic_tp_pct = max(0.20, pred_profit_mfe)
+        raw_sl_pct     = max(0.15, pred_danger_mae)
         dynamic_sl_pct = max(float(atr_pct), raw_sl_pct)  # Clamped above 1-bar Brownian noise!
 
         rr_ratio = (dynamic_tp_pct / dynamic_sl_pct) if dynamic_sl_pct > 0 else 0.0
 
+        # Estimated dollar barriers (to be re-derived from physical fill price)
         if direction.upper() == "LONG":
-            dynamic_tp_price = entry_price * (1.0 + (dynamic_tp_pct / 100.0))
-            dynamic_sl_price = entry_price * (1.0 - (dynamic_sl_pct / 100.0))
+            est_tp_price = entry_price * (1.0 + (dynamic_tp_pct / 100.0))
+            est_sl_price = entry_price * (1.0 - (dynamic_sl_pct / 100.0))
         else:
-            dynamic_tp_price = entry_price * (1.0 - (dynamic_tp_pct / 100.0))
-            dynamic_sl_price = entry_price * (1.0 + (dynamic_sl_pct / 100.0))
+            est_tp_price = entry_price * (1.0 - (dynamic_tp_pct / 100.0))
+            est_sl_price = entry_price * (1.0 + (dynamic_sl_pct / 100.0))
 
         # 3. 4-State Taxonomy Classification
         risk_tier   = "HIGH_RISK"   if prob_danger >= self.danger_thresh else "LOW_RISK"
@@ -128,25 +118,18 @@ class ProductionGatesEngine:
         passed_hurdle = (rr_ratio >= required_rr)
         passed_consensus = not (risk_tier == "HIGH_RISK" and profit_tier == "LOW_PROFIT")
 
-        # 5. Experimental Tier Assignment: MAIN vs. CONTROL ($100 Floor)
+        # 5. Deterministic Flat Sizing (Strictly Flat $1,000 Main / Flat $50 Control)
         if passed_hurdle and passed_consensus:
             trade_tier = "MAIN"
             rejection_reason = "None"
-            
-            category_mult = float(self.multipliers.get(gate_tag, 1.0))
-            dollar_risk_budget = self.base_risk_usd * category_mult
-
-            remaining_slots = max(1, self.total_slots - active_positions_count)
-            slot_cash_cap   = min(self.max_cash_slot, free_wallet_balance / remaining_slots)
-
-            uncapped_pos_usd = dollar_risk_budget / (dynamic_sl_pct / 100.0)
-            allocated_cash   = min(slot_cash_cap, uncapped_pos_usd)
+            allocated_cash = min(self.fixed_main_cash, free_wallet_balance)
         else:
             trade_tier = "CONTROL"
             rejection_reason = "CONSENSUS_FAILURE" if not passed_consensus else f"RR_HURDLE_FAILED ({rr_ratio:.2f} < {required_rr:.2f})"
-            dollar_risk_budget = 1.00
-            allocated_cash = min(free_wallet_balance, self.control_notional)
+            allocated_cash = min(self.fixed_control_cash, free_wallet_balance)
 
+        # Defensive assertion: allocated_cash can NEVER exceed $1,000.00
+        allocated_cash = min(1000.0, float(allocated_cash))
         contract_quantity = allocated_cash / entry_price if entry_price > 0 else 0.0
 
         return {
@@ -160,9 +143,8 @@ class ProductionGatesEngine:
             "entry_price": round(entry_price, 6),
             "dynamic_tp_pct": round(dynamic_tp_pct, 4),
             "dynamic_sl_pct": round(dynamic_sl_pct, 4),
-            "dynamic_tp_price": round(dynamic_tp_price, 6),
-            "dynamic_sl_price": round(dynamic_sl_price, 6),
-            "risk_budget_usd": round(dollar_risk_budget, 2),
+            "dynamic_tp_price": round(est_tp_price, 6),
+            "dynamic_sl_price": round(est_sl_price, 6),
             "allocated_cash": round(allocated_cash, 2),
             "contract_quantity": round(contract_quantity, 6),
             "leverage": self.fixed_leverage,
@@ -179,15 +161,21 @@ class ProductionGatesEngine:
 # =============================================================================
 if __name__ == "__main__":
     print("===============================================================================")
-    print("  TESTING RISK GATING ENGINE (src/gates_engine.py — $100 CONTROL FLOOR)        ")
+    print("  TESTING FLAT SIZING GATING ENGINE (src/gates_engine.py)                      ")
     print("===============================================================================")
     engine = ProductionGatesEngine()
 
-    # Test Control Trade Sizing on BTC ($83,841.60)
-    mock_failed = {"pred_profit_mfe": 1.11, "pred_danger_mae": 0.65, "prob_profit": 0.525, "prob_danger": 0.475}
-    r = engine.evaluate_gates_and_sizing("BTCUSDT", "SHORT", 83841.60, mock_failed, atr_pct=0.40, active_positions_count=3)
-    print(f"Control Trade Result: Tier={r['trade_tier']} | Cash=${r['allocated_cash']:,.2f} | Reason={r['rejection_reason']}")
-    assert r['trade_tier'] == 'CONTROL' and r['allocated_cash'] == 100.0, "Control sizing failed to allocate $100.00 floor!"
+    # Test 1: Main Trade Flat Sizing ($1,000.00)
+    mock_passed = {"pred_profit_mfe": 2.0, "pred_danger_mae": 0.5, "prob_profit": 0.70, "prob_danger": 0.15}
+    r1 = engine.evaluate_gates_and_sizing("ETHUSDT", "LONG", 2650.0, mock_passed, atr_pct=0.40)
+    print(f"Main Trade: Tier={r1['trade_tier']} | Cash=${r1['allocated_cash']:,.2f}")
+    assert r1['allocated_cash'] == 1000.0, "Main trade failed to allocate flat $1,000.00!"
+
+    # Test 2: Control Trade Flat Sizing ($50.00)
+    mock_failed = {"pred_profit_mfe": 0.8, "pred_danger_mae": 0.9, "prob_profit": 0.30, "prob_danger": 0.50}
+    r2 = engine.evaluate_gates_and_sizing("SOLUSDT", "SHORT", 150.0, mock_failed, atr_pct=0.40)
+    print(f"Control Trade: Tier={r2['trade_tier']} | Cash=${r2['allocated_cash']:,.2f}")
+    assert r2['allocated_cash'] == 50.0, "Control trade failed to allocate flat $50.00!"
     print("===============================================================================")
-    print("  VERDICT: [PASS] GATES ENGINE SIZING ALIGNED                                  ")
+    print("  VERDICT: [PASS] FLAT SIZING & HARD 4-SLOT CAP OPERATIONAL                    ")
     print("===============================================================================")

@@ -28,7 +28,7 @@
 
 name: EMA Testnet Production Daemon
 
-on:
+off:
   workflow_dispatch:
   schedule:
     # 8-Hour emergency watchdog (Resurrects bot only if self-chaining fails; avoids 40m queue collisions)
